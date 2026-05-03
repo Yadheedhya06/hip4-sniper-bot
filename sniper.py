@@ -89,7 +89,7 @@ CONFIG = {
     "max_trade_usd":       _env_float("SIZE_MAX_USD", 200),
     "edge_reference":      _env_float("EDGE_REFERENCE", 0.10),
     "max_open_positions":  _env_int("MAX_OPEN_POSITIONS", 3),
-    "equity_refresh_sec":  _env_int("EQUITY_REFRESH_SEC", 30),
+    "equity_refresh_sec":  _env_int("EQUITY_REFRESH_SEC", 300),
 
     # Training-wheels: hard cap per-trade USD regardless of equity. Empty = disabled.
     "training_wheels_max_usd": _env_opt_float("TRAINING_WHEELS_MAX_USD"),
@@ -114,10 +114,12 @@ CONFIG = {
     "use_limit_orders":     _env_bool("USE_LIMIT_ORDERS", True),
 
     # ── Discovery & polling ──
-    "discovery_interval_sec":  _env_int("DISCOVERY_INTERVAL_SEC", 30),
-    "price_poll_interval_sec": _env_int("PRICE_POLL_INTERVAL_SEC", 2),
+    "discovery_interval_sec":  _env_int("DISCOVERY_INTERVAL_SEC", 300),
+    "price_poll_interval_sec": _env_int("PRICE_POLL_INTERVAL_SEC", 15),
+    "active_poll_interval_sec": _env_int("ACTIVE_POLL_INTERVAL_SEC", 2),
+    "vol_refresh_sec":         _env_int("VOL_REFRESH_SEC", 60),
     "ws_reconnect_delay_sec":  _env_int("WS_RECONNECT_DELAY_SEC", 5),
-    "heartbeat_sec":           _env_int("HEARTBEAT_SEC", 60),
+    "heartbeat_sec":           _env_int("HEARTBEAT_SEC", 300),
 
     # ── Logging ──
     "log_to_file":   _env_bool("LOG_TO_FILE", False),   # default off in prod
@@ -899,6 +901,7 @@ class HyperliquidSniperBot:
         self._last_vol_update = 0.0
         self._last_equity_update = 0.0
         self._last_heartbeat = 0.0
+        self._active_mode: bool = False
 
         # Daily loss kill-switch state (persisted to disk so restarts honor budget)
         self._day_utc: str = ""
@@ -1079,6 +1082,33 @@ class HyperliquidSniperBot:
         log.info(f"Received signal {signum} — initiating graceful shutdown...")
         self._shutdown.set()
 
+    def _nearest_t_left_min(self) -> float:
+        """Minutes until soonest non-traded, non-expired contract expiry. inf if none."""
+        now = datetime.now(timezone.utc)
+        candidates = [
+            (c.expiry_utc - now).total_seconds() / 60
+            for c in self.contracts.values()
+            if not c.traded and c.expiry_utc > now
+        ]
+        return min(candidates) if candidates else float("inf")
+
+    def _loop_sleep_sec(self) -> float:
+        """Tight cadence inside the entry window; slow cadence when nothing is close."""
+        nearest = self._nearest_t_left_min()
+        active_window = CONFIG["max_time_left_minutes"]
+        if nearest <= active_window:
+            if not self._active_mode:
+                self._active_mode = True
+                log.info(
+                    f"ACTIVE MODE: t_left={nearest:.1f}min ≤ {active_window}min — "
+                    f"snipe cadence {CONFIG['active_poll_interval_sec']}s"
+                )
+            return CONFIG["active_poll_interval_sec"]
+        if self._active_mode:
+            self._active_mode = False
+            log.info(f"Exiting active mode — idle cadence {CONFIG['price_poll_interval_sec']}s")
+        return CONFIG["price_poll_interval_sec"]
+
     # ── Async main loop (WebSocket-based) ──
 
     async def _run_async(self):
@@ -1102,7 +1132,7 @@ class HyperliquidSniperBot:
                     self._last_discovery = now
 
                 # Periodic volatility refresh
-                if now - self._last_vol_update >= 60:  # every minute
+                if now - self._last_vol_update >= CONFIG["vol_refresh_sec"]:
                     self._refresh_volatility()
                     self._last_vol_update = now
 
@@ -1123,7 +1153,7 @@ class HyperliquidSniperBot:
                 # Clean up expired contracts
                 self._cleanup_expired()
 
-                await asyncio.sleep(CONFIG["price_poll_interval_sec"])
+                await asyncio.sleep(self._loop_sleep_sec())
         finally:
             ws_task.cancel()
             try:
@@ -1197,7 +1227,7 @@ class HyperliquidSniperBot:
                     self._discover_contracts()
                     self._last_discovery = now
 
-                if now - self._last_vol_update >= 60:
+                if now - self._last_vol_update >= CONFIG["vol_refresh_sec"]:
                     self._refresh_volatility()
                     self._last_vol_update = now
 
@@ -1210,7 +1240,7 @@ class HyperliquidSniperBot:
                 self._evaluate_all_contracts()
                 self._cleanup_expired()
 
-                time.sleep(CONFIG["price_poll_interval_sec"])
+                time.sleep(self._loop_sleep_sec())
 
             except Exception as e:
                 log.error(f"Error in polling loop: {e}", exc_info=True)
@@ -1317,16 +1347,20 @@ class HyperliquidSniperBot:
             if contract.traded:
                 continue
 
-            # Skip if no mid price for this contract
-            if contract.last_yes_mid is None:
-                yes_raw = self._mids.get(contract.yes_coin)
-                if yes_raw is None:
-                    continue
-                try:
+            # Always pull WS-fresh mids at eval time — don't latch to a stale REST snapshot.
+            yes_raw = self._mids.get(contract.yes_coin)
+            no_raw = self._mids.get(contract.no_coin)
+            try:
+                if yes_raw is not None:
                     contract.last_yes_mid = float(yes_raw)
-                    contract.last_no_mid = 1.0 - contract.last_yes_mid
-                except (ValueError, TypeError):
-                    continue
+                if no_raw is not None:
+                    contract.last_no_mid = float(no_raw)
+            except (ValueError, TypeError):
+                pass
+            if contract.last_yes_mid is None:
+                continue
+            if contract.last_no_mid is None:
+                contract.last_no_mid = 1.0 - contract.last_yes_mid
 
             # Skip if yes_mid is invalid
             if contract.last_yes_mid <= 0 or contract.last_yes_mid >= 1:
