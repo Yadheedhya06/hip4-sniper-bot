@@ -6,6 +6,18 @@ Monitors Hyperliquid HIP-4 BTC binary outcome contracts and places small buy
 orders on the winning side in the final minutes before settlement when there
 is a clear statistical edge between the model probability and market price.
 
+Entry conditions are a hybrid of three gates (all must pass):
+    1. Time gate           — within MAX_TIME_LEFT_MINUTES of expiry
+    2. Statistical gate    — |d| ≥ dynamic min_d AND edge ≥ threshold.
+                             min_d decays linearly with time_left so we accept
+                             weaker statistical signals as expiry approaches.
+    3. Conviction gate     — taker-buy volume ratio AND same-side bid depth
+                             imbalance both clear thresholds that *tighten* as
+                             statistical confidence weakens.
+Pure-flow override: in the final PURE_FLOW_TIME_LEFT_MIN seconds the
+statistical floor relaxes to MIN_D_FLOOR while conviction thresholds are
+forced to maximum strictness — flow dominates near settlement.
+
 Usage:
     export HYPERLIQUID_PRIVATE_KEY="0x..."
     python sniper.py
@@ -78,20 +90,30 @@ def _env_opt_float(key: str) -> Optional[float]:
         return None
 
 # =============================================================================
-# CONFIGURATION — adjust these to your risk tolerance
+# CONFIGURATION
+# =============================================================================
+# Tuned for ~$800 equity with $100 hard per-trade cap. All values are
+# env-overridable. Sections:
+#   • Risk model         — fractional sizing with edge scaling, capped at $100
+#   • Statistical gate   — dynamic |d| floor that decays with time_left
+#   • Conviction gate    — taker-buy volume + same-side bid depth, with
+#                          thresholds that tighten as |d| weakens
+#   • Pure-flow window   — final 60-90s where flow dominates
 # =============================================================================
 
 CONFIG = {
     # ── Risk model (env-overridable) ──
-    "base_risk_pct":       _env_float("SIZE_PCT_OF_EQUITY", 0.05),   # 5% of equity baseline
-    "max_risk_pct":        _env_float("SIZE_MAX_PCT_OF_EQUITY", 0.10),
+    # At equity=$800: base risk = $80 (10%); clamped to ≤ $100 by max_risk_pct + cap.
+    "base_risk_pct":       _env_float("SIZE_PCT_OF_EQUITY", 0.10),
+    "max_risk_pct":        _env_float("SIZE_MAX_PCT_OF_EQUITY", 0.125),
     "min_trade_usd":       _env_float("SIZE_MIN_USD", 10),
-    "max_trade_usd":       _env_float("SIZE_MAX_USD", 200),
+    "max_trade_usd":       _env_float("SIZE_MAX_USD", 100),
     "edge_reference":      _env_float("EDGE_REFERENCE", 0.10),
     "max_open_positions":  _env_int("MAX_OPEN_POSITIONS", 3),
     "equity_refresh_sec":  _env_int("EQUITY_REFRESH_SEC", 300),
 
-    # Training-wheels: hard cap per-trade USD regardless of equity. Empty = disabled.
+    # Training-wheels: hard cap per-trade USD regardless of equity.
+    # Empty/unset = disabled (rely on SIZE_MAX_USD instead).
     "training_wheels_max_usd": _env_opt_float("TRAINING_WHEELS_MAX_USD"),
     "equity_floor_usd":    _env_float("EQUITY_FLOOR_USD", 50),
 
@@ -99,11 +121,36 @@ CONFIG = {
     "daily_loss_limit_pct": _env_float("DAILY_LOSS_LIMIT_PCT", 0.10),  # 10% of day-start
     "daily_state_file":    os.environ.get("DAILY_STATE_FILE", "daily_state.json"),
 
-    # ── Edge & entry thresholds ──
+    # ── Statistical gate (dynamic |d| floor) ──
+    # min_d_required = max(MIN_D_FLOOR, MIN_D_BASE * (time_left / MAX_TIME_LEFT_MIN))
+    # MIN_ABS_D is honored as a fallback for backwards-compat with old env files.
+    "min_d_base":          _env_float("MIN_D_BASE", _env_float("MIN_ABS_D", 1.8)),
+    "min_d_floor":         _env_float("MIN_D_FLOOR", 0.3),
     "edge_threshold":      _env_float("EDGE_THRESHOLD", 0.10),
-    "min_abs_d":           _env_float("MIN_ABS_D", 1.8),
-    "max_time_left_minutes": _env_float("MAX_TIME_LEFT_MIN", 5.0),
+    "max_time_left_minutes":   _env_float("MAX_TIME_LEFT_MIN", 5.0),
     "ideal_time_left_minutes": _env_float("IDEAL_TIME_LEFT_MIN", 3.0),
+
+    # ── Conviction gate (taker-buy volume + same-side bid depth) ──
+    # Required vol_ratio and depth_imb scale linearly with statistical
+    # confidence: conf = min(1, |d| / MIN_D_BASE).
+    #   required_vol_ratio = MAX - conf*(MAX - MIN)
+    #   required_depth_imb = MAX - conf*(MAX - MIN)
+    # At |d|=MIN_D_BASE → MIN thresholds. At |d|→0 → MAX thresholds.
+    "volume_ratio_min":      _env_float("VOLUME_RATIO_MIN", 1.5),
+    "volume_ratio_max":      _env_float("VOLUME_RATIO_MAX", 2.5),
+    "depth_imb_min":         _env_float("DEPTH_IMB_MIN", 0.60),
+    "depth_imb_max":         _env_float("DEPTH_IMB_MAX", 0.70),
+    "volume_lookback_min":   _env_float("VOLUME_LOOKBACK_MIN", 10.0),
+    "depth_price_band_pct":  _env_float("DEPTH_PRICE_BAND_PCT", 0.05),
+    "depth_fallback_levels": _env_int("DEPTH_FALLBACK_LEVELS", 10),
+    "depth_min_qualifying_levels": _env_int("DEPTH_MIN_QUALIFYING_LEVELS", 3),
+
+    # ── Pure-flow window (final 60-90s) ──
+    # Statistical floor drops to MIN_D_FLOOR; edge threshold relaxes; conviction
+    # thresholds clamp to MAX (strictest). Refuses to trade on stale tape.
+    "pure_flow_time_left_min":  _env_float("PURE_FLOW_TIME_LEFT_MIN", 1.5),
+    "pure_flow_edge_threshold": _env_float("PURE_FLOW_EDGE_THRESHOLD", 0.05),
+    "pure_flow_freshness_sec":  _env_float("PURE_FLOW_FRESHNESS_SEC", 60.0),
 
     # ── Volatility estimation ──
     "vol_windows": [15, 30, 60],
@@ -120,6 +167,7 @@ CONFIG = {
     "vol_refresh_sec":         _env_int("VOL_REFRESH_SEC", 60),
     "ws_reconnect_delay_sec":  _env_int("WS_RECONNECT_DELAY_SEC", 5),
     "ws_ping_interval_sec":    _env_int("WS_PING_INTERVAL_SEC", 30),
+    "ws_sub_reconcile_sec":    _env_int("WS_SUB_RECONCILE_SEC", 5),
     "heartbeat_sec":           _env_int("HEARTBEAT_SEC", 300),
 
     # ── Logging ──
@@ -188,6 +236,7 @@ class BinaryContract:
     traded: bool = False
     last_yes_mid: Optional[float] = None
     last_no_mid: Optional[float] = None
+    pure_flow_logged: bool = False  # one-shot log when entering pure-flow window
 
 
 @dataclass
@@ -201,7 +250,7 @@ class VolEstimate:
 
 @dataclass
 class TradeDecision:
-    """Captures every evaluation for logging."""
+    """Captures every evaluation for logging — statistical + conviction signals."""
     timestamp: datetime
     contract: str
     btc_price: float
@@ -214,6 +263,12 @@ class TradeDecision:
     edge: float
     action: str             # "BUY_YES", "BUY_NO", "SKIP"
     reason: str
+    mode: str = "STAT"      # "STAT" | "HYBRID" | "PURE_FLOW"
+    min_d_required: float = 0.0
+    vol_ratio: Optional[float] = None
+    vol_ratio_required: float = 0.0
+    depth_imbalance: Optional[float] = None
+    depth_imb_required: float = 0.0
 
 
 # =============================================================================
@@ -428,8 +483,6 @@ class HyperliquidClient:
         Requires manual EIP-712 signing — left as a TODO since the SDK handles this.
         """
         # TODO: Implement raw EIP-712 signed order if SDK is unavailable.
-        # This requires constructing the order action, hashing it per EIP-712,
-        # signing with the private key, and POSTing to /exchange.
         log.error("Raw order placement not implemented — install hyperliquid SDK")
         return {"error": "raw_not_implemented"}
 
@@ -444,8 +497,6 @@ def parse_binary_description(desc: str) -> Optional[dict]:
 
     Example format:
         class:priceBinary|underlying:BTC|expiry:20260503-0600|targetPrice:78213|period:1d
-
-    Returns dict with parsed fields or None if not a BTC priceBinary.
     """
     if "priceBinary" not in desc or "BTC" not in desc:
         return None
@@ -460,10 +511,8 @@ def parse_binary_description(desc: str) -> Optional[dict]:
         return None
 
     try:
-        # Parse expiry: "20260503-0600" -> datetime
         expiry_str = fields["expiry"]
         expiry_dt = datetime.strptime(expiry_str, "%Y%m%d-%H%M").replace(tzinfo=timezone.utc)
-
         return {
             "underlying": fields["underlying"],
             "target_price": float(fields["targetPrice"]),
@@ -489,11 +538,7 @@ def _outcome_asset_id(outcome_id: int, side: int) -> int:
 
 
 def discover_btc_binaries(client: "HyperliquidClient") -> list[BinaryContract]:
-    """
-    Scan HIP-4 outcomeMeta for active BTC priceBinary contracts not yet expired.
-    Each outcome has two coins (#<10*o+0>=Yes, #<10*o+1>=No); we model one
-    BinaryContract per outcome and carry both coin ids.
-    """
+    """Scan HIP-4 outcomeMeta for active BTC priceBinary contracts not yet expired."""
     contracts: list[BinaryContract] = []
     now = datetime.now(timezone.utc)
 
@@ -517,7 +562,6 @@ def discover_btc_binaries(client: "HyperliquidClient") -> list[BinaryContract]:
         if parsed["expiry_utc"] <= now:
             continue
 
-        # Sanity: HIP-4 sideSpecs should be exactly [Yes, No] in that order.
         sides = entry.get("sideSpecs", [])
         if len(sides) != 2:
             log.warning(f"outcome={outcome_id} has {len(sides)} sides, expected 2 — skipping")
@@ -598,7 +642,6 @@ class VolatilityCalculator:
         self.prices.clear()
         for candle in candles:
             try:
-                # Candle format: {"t": timestamp_ms, "c": close, ...}
                 ts = candle.get("t", candle.get("T", 0))
                 if ts > 1e12:  # milliseconds
                     ts = ts / 1000
@@ -611,9 +654,7 @@ class VolatilityCalculator:
         log.debug(f"Loaded {len(self.prices)} candle prices for vol calc")
 
     def calculate(self) -> Optional[VolEstimate]:
-        """
-        σ = max over windows of stdev(1m log returns) * √(minutes per year).
-        """
+        """σ = max over windows of stdev(1m log returns) * √(minutes per year)."""
         if len(self.prices) < 5:
             log.warning(f"Not enough price data for vol calc ({len(self.prices)} points)")
             return None
@@ -662,142 +703,104 @@ def compute_model_probability(
     sigma_annual: float,
 ) -> tuple[float, float]:
     """
-    Compute the model probability of Yes (BTC ≥ strike at expiry).
-
-    Uses normal approximation:
-        T = time_left_minutes / 525600
+    Normal approximation for P(BTC ≥ strike at expiry):
+        T = time_left_minutes / 525_600
         d = (S - K) / (S * σ * √T)
         P(Yes) = Φ(d)
-
-    Returns: (p_yes, d_value)
     """
     if time_left_minutes <= 0:
-        # Already expired — outcome is deterministic
-        return (1.0 if btc_price >= strike else 0.0, float('inf') if btc_price >= strike else float('-inf'))
+        return (1.0 if btc_price >= strike else 0.0,
+                float('inf') if btc_price >= strike else float('-inf'))
 
     T = time_left_minutes / MINUTES_PER_YEAR
-
-    # Denominator: S * σ * √T
     denom = btc_price * sigma_annual * math.sqrt(T)
     if denom <= 0:
         return (1.0 if btc_price >= strike else 0.0, 0.0)
 
     d = (btc_price - strike) / denom
     p_yes = norm.cdf(d)
-
     return (p_yes, d)
 
 
-def evaluate_edge(
-    contract: BinaryContract,
-    btc_price: float,
-    yes_mid: float,
-    vol_estimate: VolEstimate,
-) -> TradeDecision:
-    """
-    Evaluate whether there's a tradable edge on this contract.
+# =============================================================================
+# TRADES TAPE TRACKER (per-coin taker-buy volume from WS `trades` feed)
+# =============================================================================
+#
+# Conviction signal (Option B): for each outcome coin, maintain a rolling
+# window of trades and sum the size of those whose taker side was a buyer
+# ("aggressive buying"). Captures whale stacking on one side without the
+# noise of total-volume comparisons.
+#
+# Side normalization handles both schemas Hyperliquid has used:
+#   • "B"/"S" or "B"/"A"  (legacy single-letter)
+#   • "Buy"/"Sell"        (current)
 
-    Returns a TradeDecision with action = BUY_YES, BUY_NO, or SKIP.
-    """
-    now = datetime.now(timezone.utc)
-    time_left_min = (contract.expiry_utc - now).total_seconds() / 60
+class TradesTracker:
+    """Per-coin rolling tape of (timestamp, side, size). Single-threaded."""
 
-    p_yes, d_val = compute_model_probability(
-        btc_price=btc_price,
-        strike=contract.target_price,
-        time_left_minutes=time_left_min,
-        sigma_annual=vol_estimate.annualized,
-    )
-    p_no = 1.0 - p_yes
+    def __init__(self, lookback_minutes: float):
+        self.lookback_sec = lookback_minutes * 60
+        self.trades: dict[str, list[tuple[float, str, float]]] = {}
+        self._last_trade_ts: dict[str, float] = {}
 
-    # Edge for buying Yes
-    edge_yes = p_yes - yes_mid
-    # Edge for buying No (No mid = 1 - Yes mid)
-    no_mid = 1.0 - yes_mid
-    edge_no = p_no - no_mid
+    @staticmethod
+    def _normalize_side(raw: str) -> str:
+        s = (raw or "").strip().upper()
+        if s in ("B", "BUY", "BID"):
+            return "Buy"
+        if s in ("S", "A", "SELL", "ASK"):
+            return "Sell"
+        return "Unknown"
 
-    # Default: skip
-    action = "SKIP"
-    reason_parts = []
+    def add_trade(self, coin: str, ts_sec: float, side_raw: str, size: float):
+        side = self._normalize_side(side_raw)
+        bucket = self.trades.setdefault(coin, [])
+        bucket.append((ts_sec, side, size))
+        self._last_trade_ts[coin] = max(self._last_trade_ts.get(coin, 0.0), ts_sec)
+        # Keep up to 2x lookback for safety margin; trim only when oldest entry is stale.
+        cutoff = ts_sec - self.lookback_sec * 2
+        if bucket and bucket[0][0] < cutoff:
+            self.trades[coin] = [t for t in bucket if t[0] >= cutoff]
 
-    # ── Check time constraint ──
-    if time_left_min > CONFIG["max_time_left_minutes"]:
-        reason_parts.append(f"time_left={time_left_min:.1f}m > max={CONFIG['max_time_left_minutes']}m")
-    elif time_left_min <= 0:
-        reason_parts.append("expired")
-    else:
-        # ── Check for Buy Yes ──
-        if (edge_yes >= CONFIG["edge_threshold"]
-                and d_val >= CONFIG["min_abs_d"]
-                and time_left_min <= CONFIG["max_time_left_minutes"]):
-            action = "BUY_YES"
-            reason_parts.append(
-                f"YES edge={edge_yes:.4f} >= {CONFIG['edge_threshold']}, "
-                f"d={d_val:.3f} >= {CONFIG['min_abs_d']}"
-            )
+    def taker_buy_volume(self, coin: str, now_ts: Optional[float] = None) -> float:
+        if coin not in self.trades:
+            return 0.0
+        if now_ts is None:
+            now_ts = time.time()
+        cutoff = now_ts - self.lookback_sec
+        return sum(sz for ts, side, sz in self.trades[coin]
+                   if side == "Buy" and ts >= cutoff)
 
-        # ── Check for Buy No ──
-        elif (edge_no >= CONFIG["edge_threshold"]
-              and d_val <= -CONFIG["min_abs_d"]
-              and time_left_min <= CONFIG["max_time_left_minutes"]):
-            action = "BUY_NO"
-            reason_parts.append(
-                f"NO edge={edge_no:.4f} >= {CONFIG['edge_threshold']}, "
-                f"d={d_val:.3f} <= -{CONFIG['min_abs_d']}"
-            )
+    def is_fresh(self, coin: str, max_age_sec: float, now_ts: Optional[float] = None) -> bool:
+        if now_ts is None:
+            now_ts = time.time()
+        last = self._last_trade_ts.get(coin, 0.0)
+        return last > 0 and (now_ts - last) <= max_age_sec
 
-        else:
-            # Not enough edge
-            if abs(d_val) < CONFIG["min_abs_d"]:
-                reason_parts.append(f"|d|={abs(d_val):.3f} < {CONFIG['min_abs_d']}")
-            if edge_yes < CONFIG["edge_threshold"] and edge_no < CONFIG["edge_threshold"]:
-                reason_parts.append(
-                    f"edge_yes={edge_yes:.4f}, edge_no={edge_no:.4f} "
-                    f"< threshold={CONFIG['edge_threshold']}"
-                )
-
-    reason = "; ".join(reason_parts) if reason_parts else "no conditions met"
-
-    decision = TradeDecision(
-        timestamp=now,
-        contract=contract.asset_name,
-        btc_price=btc_price,
-        strike=contract.target_price,
-        time_left_min=time_left_min,
-        sigma=vol_estimate.annualized,
-        d_value=d_val,
-        p_model_yes=p_yes,
-        market_mid_yes=yes_mid,
-        edge=max(edge_yes, edge_no),
-        action=action,
-        reason=reason,
-    )
-    return decision
+    def drop_coin(self, coin: str):
+        self.trades.pop(coin, None)
+        self._last_trade_ts.pop(coin, None)
 
 
 # =============================================================================
 # POSITION SIZING & RISK MANAGEMENT
 # =============================================================================
 #
-# Spec (implement exactly):
-#   base_risk  = equity * BASE_RISK_PCT
-#   edge_scale = edge / EDGE_REFERENCE                 # e.g. 0.12 edge -> 1.2x
-#   risk_amount = base_risk * min(2.0, max(0.6, edge_scale))
-#   risk_amount = max(MIN_TRADE_USD,
-#                     min(risk_amount, equity * MAX_RISK_PCT, MAX_TRADE_USD))
-#   shares = floor(risk_amount / entry_price)
-
+#   base_risk   = equity · BASE_RISK_PCT
+#   edge_scale  = clamp(edge / EDGE_REFERENCE, 0.6, 2.0)
+#   risk_amount = base_risk · edge_scale
+#   risk_amount = clamp(risk_amount, MIN_TRADE_USD,
+#                       equity·MAX_RISK_PCT, MAX_TRADE_USD, TRAINING_WHEELS)
+#   shares      = floor(risk_amount / entry_price)
+#
+# Defaults tuned for $800 equity → $80 baseline / $100 hard cap.
 
 def compute_position_size(
     equity: float,
     edge: float,
     entry_price: float,
 ) -> tuple[float, int]:
-    """
-    Returns (risk_amount_usd, shares) for a trade given current equity, the
-    magnitude of the edge (|P_model - market_mid|), and the entry price per
-    share (current_mid or best ask).
-    """
+    """Returns (risk_amount_usd, shares)."""
     if equity <= 0 or entry_price <= 0:
         return 0.0, 0
 
@@ -812,7 +815,7 @@ def compute_position_size(
     risk_amount = base_risk * min(2.0, max(0.6, edge_scale))
     risk_amount = max(min_usd, min(risk_amount, equity * max_pct, max_usd))
 
-    # Training-wheels: hard cap regardless of equity, only if configured.
+    # Training-wheels: hard cap regardless of equity. None/empty disables.
     tw = CONFIG.get("training_wheels_max_usd")
     if tw is not None and tw > 0:
         risk_amount = min(risk_amount, tw)
@@ -822,7 +825,7 @@ def compute_position_size(
 
 
 # =============================================================================
-# ORDERBOOK ANALYSIS
+# ORDERBOOK ANALYSIS (slippage check before crossing)
 # =============================================================================
 
 def check_orderbook_depth(
@@ -832,10 +835,7 @@ def check_orderbook_depth(
     size_usd: float,
 ) -> tuple[bool, float, float]:
     """
-    Check if the orderbook has enough depth for our size with acceptable slippage.
-
-    Returns: (has_depth, avg_fill_price, best_price)
-        best_price = top of the side we're crossing (best ask for a buy).
+    Walk the book on the side we're crossing; return (has_depth, avg_fill, best_price).
     """
     try:
         book = client.get_l2_book(coin)
@@ -843,19 +843,15 @@ def check_orderbook_depth(
         log.warning(f"Failed to fetch orderbook for {coin}: {e}")
         return False, 0.0, 0.0
 
-    # Parse the book — format: {"levels": [[bids], [asks]]}
     levels = book.get("levels", [[], []])
     if len(levels) < 2:
         return False, 0.0, 0.0
 
-    # For buying, we hit the asks; for selling, we hit the bids
     side = levels[1] if is_buy else levels[0]
-
     if not side:
         log.debug(f"No {'asks' if is_buy else 'bids'} in book for {coin}")
         return False, 0.0, 0.0
 
-    # Walk the book and calculate fill price
     remaining_usd = size_usd
     total_cost = 0.0
     total_size = 0.0
@@ -895,17 +891,95 @@ def check_orderbook_depth(
 
 
 # =============================================================================
+# DEPTH IMBALANCE (Option A: same-side bid depth across both coins)
+# =============================================================================
+
+def _sum_bids_in_band(
+    book: dict,
+    mid: float,
+    band_pct: float,
+    fallback_levels: int,
+    min_qualifying: int,
+) -> float:
+    """
+    Sum bid sizes within ±band_pct of mid for the favorable coin's bid side.
+    Falls back to top-N bids if fewer than min_qualifying levels are in band —
+    typical for sparse outcome books with one big bid then nothing.
+    """
+    levels = book.get("levels", [[], []])
+    if not levels:
+        return 0.0
+    bids = levels[0] if len(levels) >= 1 else []
+    if not bids:
+        return 0.0
+
+    parsed: list[tuple[float, float]] = []
+    for lvl in bids:
+        try:
+            px = float(lvl.get("px", lvl[0]) if isinstance(lvl, dict) else lvl[0])
+            sz = float(lvl.get("sz", lvl[1]) if isinstance(lvl, dict) else lvl[1])
+        except (IndexError, ValueError, TypeError):
+            continue
+        if px > 0 and sz > 0:
+            parsed.append((px, sz))
+
+    if not parsed:
+        return 0.0
+
+    if mid > 0:
+        low = mid * (1.0 - band_pct)
+        in_band = [(px, sz) for px, sz in parsed if low <= px <= mid]
+    else:
+        in_band = []
+
+    if len(in_band) >= min_qualifying:
+        return sum(sz for _, sz in in_band)
+
+    # Fallback: top N bids (HL returns sorted, best first)
+    return sum(sz for _, sz in parsed[:fallback_levels])
+
+
+def compute_depth_imbalance(
+    client: "HyperliquidClient",
+    favorable_coin: str,
+    favorable_mid: float,
+    unfavorable_coin: str,
+    unfavorable_mid: float,
+) -> tuple[float, float, Optional[float]]:
+    """
+    Returns (favorable_bid_depth, unfavorable_bid_depth, imbalance ∈ [0,1]).
+    imbalance = favorable / (favorable + unfavorable). None if both are zero.
+    """
+    band_pct = CONFIG["depth_price_band_pct"]
+    fallback = CONFIG["depth_fallback_levels"]
+    min_qual = CONFIG["depth_min_qualifying_levels"]
+
+    try:
+        fav_book = client.get_l2_book(favorable_coin)
+        unfav_book = client.get_l2_book(unfavorable_coin)
+    except Exception as e:
+        log.warning(f"Depth fetch failed for {favorable_coin}/{unfavorable_coin}: {e}")
+        return 0.0, 0.0, None
+
+    fav = _sum_bids_in_band(fav_book, favorable_mid, band_pct, fallback, min_qual)
+    unfav = _sum_bids_in_band(unfav_book, unfavorable_mid, band_pct, fallback, min_qual)
+    total = fav + unfav
+    if total <= 0:
+        return fav, unfav, None
+    return fav, unfav, fav / total
+
+
+# =============================================================================
 # MAIN BOT CLASS
 # =============================================================================
 
 class HyperliquidSniperBot:
-    """
-    Main bot that orchestrates discovery, monitoring, edge evaluation, and execution.
-    """
+    """Orchestrates discovery, monitoring, edge evaluation, conviction, execution."""
 
     def __init__(self, private_key: str):
         self.client = HyperliquidClient(private_key)
         self.vol_calc = VolatilityCalculator()
+        self.trades_tracker = TradesTracker(CONFIG["volume_lookback_min"])
         self.contracts: dict[str, BinaryContract] = {}  # name -> contract
         self.open_positions: int = 0
         self._shutdown = threading.Event()
@@ -918,6 +992,11 @@ class HyperliquidSniperBot:
         self._last_equity_update = 0.0
         self._last_heartbeat = 0.0
         self._active_mode: bool = False
+
+        # WS trades subscription state
+        self._desired_trade_coins: set[str] = set()
+        self._actual_trade_subs: set[str] = set()
+        self._side_field_validated: bool = False
 
         # Daily loss kill-switch state (persisted to disk so restarts honor budget)
         self._day_utc: str = ""
@@ -975,7 +1054,6 @@ class HyperliquidSniperBot:
         """Refresh day boundary, recompute kill-switch from latest equity."""
         today = self._today_utc()
         if today != self._day_utc:
-            # Day rollover: reset budget to current equity
             self._day_utc = today
             self._day_start_equity = self._equity
             self._kill_switch_engaged = False
@@ -986,7 +1064,6 @@ class HyperliquidSniperBot:
             return True
 
         if self._day_start_equity <= 0:
-            # First read of the day arrived after init: anchor it now.
             if self._equity > 0:
                 self._day_start_equity = self._equity
                 self._save_daily_state()
@@ -1024,6 +1101,9 @@ class HyperliquidSniperBot:
                         "day_utc": bot._day_utc,
                         "day_start_equity": bot._day_start_equity,
                         "dry_run": CONFIG["dry_run"],
+                        "trade_subs_desired": len(bot._desired_trade_coins),
+                        "trade_subs_actual": len(bot._actual_trade_subs),
+                        "active_mode": bot._active_mode,
                         "ts": datetime.now(timezone.utc).isoformat(),
                     }
                     body = json.dumps(payload).encode()
@@ -1052,6 +1132,7 @@ class HyperliquidSniperBot:
         log.info(
             f"HB equity=${self._equity:.2f} btc={self._btc_price:.2f} "
             f"contracts={len(self.contracts)} open={self.open_positions} "
+            f"trade_subs={len(self._actual_trade_subs)}/{len(self._desired_trade_coins)} "
             f"kill={self._kill_switch_engaged} day={self._day_utc}"
         )
 
@@ -1065,33 +1146,42 @@ class HyperliquidSniperBot:
             f"Risk: base={CONFIG['base_risk_pct']*100:.2f}%  "
             f"max={CONFIG['max_risk_pct']*100:.2f}%  "
             f"trade=${CONFIG['min_trade_usd']}-{CONFIG['max_trade_usd']}  "
+            f"tw_cap={('$' + str(CONFIG['training_wheels_max_usd'])) if CONFIG['training_wheels_max_usd'] else 'off'}  "
             f"edge_ref={CONFIG['edge_reference']}"
         )
         log.info(
-            f"Entry: edge≥{CONFIG['edge_threshold']}  "
-            f"|d|≥{CONFIG['min_abs_d']}  "
+            f"Stat gate: edge≥{CONFIG['edge_threshold']}  "
+            f"min_d_base={CONFIG['min_d_base']}  min_d_floor={CONFIG['min_d_floor']}  "
             f"t≤{CONFIG['max_time_left_minutes']}min "
             f"(ideal <{CONFIG['ideal_time_left_minutes']}min)"
+        )
+        log.info(
+            f"Conviction gate: vol_ratio={CONFIG['volume_ratio_min']}-{CONFIG['volume_ratio_max']}  "
+            f"depth_imb={CONFIG['depth_imb_min']}-{CONFIG['depth_imb_max']}  "
+            f"vol_lookback={CONFIG['volume_lookback_min']}min  "
+            f"depth_band=±{CONFIG['depth_price_band_pct']*100:.1f}%"
+        )
+        log.info(
+            f"Pure-flow: t<{CONFIG['pure_flow_time_left_min']}min  "
+            f"edge≥{CONFIG['pure_flow_edge_threshold']}  "
+            f"freshness≤{CONFIG['pure_flow_freshness_sec']:.0f}s"
         )
         log.info(f"Wallet: {self._wallet_address or '(unknown)'}")
         log.info("=" * 60)
 
-        # Register signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
 
-        # Start healthcheck HTTP server (Railway expects $PORT bound)
         self._start_health_server()
         self._heartbeat(force=True)
 
         try:
-            # Try async WebSocket approach first
             asyncio.run(self._run_async())
         except KeyboardInterrupt:
             log.info("Interrupted — shutting down...")
         except Exception as e:
             log.error(f"Fatal error in async loop: {e}", exc_info=True)
-            log.info("Falling back to polling mode...")
+            log.info("Falling back to polling mode (conviction gate will be flow-blind)...")
             self._run_polling()
 
     def _handle_signal(self, signum, frame):
@@ -1142,7 +1232,6 @@ class HyperliquidSniperBot:
             while not self._shutdown.is_set():
                 now = time.time()
 
-                # Periodic discovery of new contracts
                 if now - self._last_discovery >= CONFIG["discovery_interval_sec"]:
                     self._discover_contracts()
                     self._last_discovery = now
@@ -1156,21 +1245,15 @@ class HyperliquidSniperBot:
                     self._refresh_volatility()
                     self._last_vol_update = now
 
-                # Periodic equity refresh
                 if now - self._last_equity_update >= CONFIG["equity_refresh_sec"]:
                     self._refresh_equity()
 
                 # Refresh prices (fallback if WS is lagging)
                 self._refresh_btc_price()
 
-                # Refresh kill-switch + heartbeat
                 self._kill_switch_can_trade()
                 self._heartbeat()
-
-                # Evaluate all active contracts
                 self._evaluate_all_contracts()
-
-                # Clean up expired contracts
                 self._cleanup_expired()
 
                 await asyncio.sleep(self._loop_sleep_sec())
@@ -1183,9 +1266,10 @@ class HyperliquidSniperBot:
             log.info("Bot shutdown complete.")
 
     async def _ws_listener(self):
-        """WebSocket listener: streams allMids + BTC 1m candles; sends app-level pings."""
+        """Streams allMids + BTC 1m candles + per-coin trades; keepalive ping; sub manager."""
         while not self._shutdown.is_set():
             ping_task = None
+            sub_mgr_task = None
             try:
                 async with websockets.connect(
                     CONFIG["ws_url"],
@@ -1193,6 +1277,7 @@ class HyperliquidSniperBot:
                     ping_timeout=None,  # rely on HL app-level ping; don't kill conn on missing protocol pong
                     close_timeout=5,
                 ) as ws:
+                    # Initial subs: allMids + candle@BTC@1m + every currently desired trade coin.
                     await ws.send(json.dumps({
                         "method": "subscribe",
                         "subscription": {"type": "allMids"},
@@ -1201,10 +1286,21 @@ class HyperliquidSniperBot:
                         "method": "subscribe",
                         "subscription": {"type": "candle", "coin": "BTC", "interval": "1m"},
                     }))
-                    log.info("WebSocket connected — subscribed to allMids + candle@BTC@1m")
+                    self._actual_trade_subs.clear()
+                    for coin in list(self._desired_trade_coins):
+                        await ws.send(json.dumps({
+                            "method": "subscribe",
+                            "subscription": {"type": "trades", "coin": coin},
+                        }))
+                        self._actual_trade_subs.add(coin)
+                    log.info(
+                        f"WebSocket connected — allMids + candle@BTC@1m + "
+                        f"{len(self._actual_trade_subs)} trade tape(s)"
+                    )
 
                     # HL closes idle connections at 60s; send {"method":"ping"} every 30s.
                     ping_task = asyncio.create_task(self._ws_ping_loop(ws))
+                    sub_mgr_task = asyncio.create_task(self._ws_sub_manager(ws))
 
                     async for raw_msg in ws:
                         if self._shutdown.is_set():
@@ -1220,12 +1316,13 @@ class HyperliquidSniperBot:
             except Exception as e:
                 log.warning(f"WebSocket error: {e} — reconnecting in {CONFIG['ws_reconnect_delay_sec']}s")
             finally:
-                if ping_task is not None and not ping_task.done():
-                    ping_task.cancel()
-                    try:
-                        await ping_task
-                    except asyncio.CancelledError:
-                        pass
+                for t in (ping_task, sub_mgr_task):
+                    if t is not None and not t.done():
+                        t.cancel()
+                        try:
+                            await t
+                        except asyncio.CancelledError:
+                            pass
 
             if not self._shutdown.is_set():
                 await asyncio.sleep(CONFIG["ws_reconnect_delay_sec"])
@@ -1243,6 +1340,43 @@ class HyperliquidSniperBot:
         except Exception as e:
             log.debug(f"Ping loop ended: {e}")
 
+    async def _ws_sub_manager(self, ws):
+        """Reconciles desired vs actual trade subscriptions every N seconds."""
+        interval = CONFIG["ws_sub_reconcile_sec"]
+        try:
+            while not self._shutdown.is_set():
+                await asyncio.sleep(interval)
+                # Subscribe to newly-desired coins
+                to_add = self._desired_trade_coins - self._actual_trade_subs
+                for coin in list(to_add):
+                    try:
+                        await ws.send(json.dumps({
+                            "method": "subscribe",
+                            "subscription": {"type": "trades", "coin": coin},
+                        }))
+                        self._actual_trade_subs.add(coin)
+                        log.info(f"WS: subscribed to trades:{coin}")
+                    except Exception as e:
+                        log.warning(f"WS sub failed for {coin}: {e}")
+                        return  # let outer loop reconnect
+
+                # Unsubscribe from no-longer-desired coins
+                to_remove = self._actual_trade_subs - self._desired_trade_coins
+                for coin in list(to_remove):
+                    try:
+                        await ws.send(json.dumps({
+                            "method": "unsubscribe",
+                            "subscription": {"type": "trades", "coin": coin},
+                        }))
+                        self._actual_trade_subs.discard(coin)
+                        self.trades_tracker.drop_coin(coin)
+                        log.info(f"WS: unsubscribed from trades:{coin}")
+                    except Exception as e:
+                        log.warning(f"WS unsub failed for {coin}: {e}")
+                        return
+        except asyncio.CancelledError:
+            raise
+
     def _handle_ws_message(self, msg: dict):
         """Process incoming WebSocket messages."""
         channel = msg.get("channel", "")
@@ -1253,13 +1387,14 @@ class HyperliquidSniperBot:
             if isinstance(mids, dict):
                 self._mids.update(mids)
                 # Update BTC price
-                for key in ["BTC", "BTC-PERP", "@1"]:  # common BTC identifiers
+                for key in ("BTC", "BTC-PERP", "@1"):
                     if key in mids:
                         try:
                             self._btc_price = float(mids[key])
                         except (ValueError, TypeError):
                             pass
                         break
+
         elif channel == "candle":
             # Server sends Candle | Candle[]; handle both shapes.
             items = data if isinstance(data, list) else [data]
@@ -1276,6 +1411,36 @@ class HyperliquidSniperBot:
                     self.vol_calc.set_price(float(t_ms) / 1000.0, float(close))
                 except (ValueError, TypeError):
                     continue
+
+        elif channel == "trades":
+            # `data` is a list of trade dicts. One-shot validate the schema.
+            if isinstance(data, list):
+                for trade in data:
+                    if not isinstance(trade, dict):
+                        continue
+                    coin = trade.get("coin")
+                    side_raw = trade.get("side", "")
+                    try:
+                        sz = float(trade.get("sz", 0))
+                        ts_ms = trade.get("time", trade.get("t", 0))
+                        ts = ts_ms / 1000.0 if ts_ms > 1e12 else float(ts_ms)
+                    except (ValueError, TypeError):
+                        continue
+                    if not coin or sz <= 0 or ts <= 0:
+                        continue
+
+                    if not self._side_field_validated:
+                        if str(side_raw).strip().upper() not in ("B", "S", "A", "BUY", "SELL"):
+                            log.warning(
+                                f"trades.side has unexpected value {side_raw!r} for {coin}; "
+                                "conviction signal may be unreliable"
+                            )
+                        else:
+                            log.info(f"trades schema validated (side={side_raw!r} on {coin})")
+                        self._side_field_validated = True
+
+                    self.trades_tracker.add_trade(coin, ts, side_raw, sz)
+
         elif channel == "pong":
             return  # heartbeat ack
         elif channel == "subscriptionResponse":
@@ -1284,7 +1449,11 @@ class HyperliquidSniperBot:
     # ── Polling fallback ──
 
     def _run_polling(self):
-        """Fallback polling loop if WebSocket fails."""
+        """Fallback polling loop if WebSocket fails. Conviction gate will block all trades."""
+        log.warning(
+            "POLLING MODE: no WS trades data; conviction gate will block all trades. "
+            "Investigate WS failure to restore normal operation."
+        )
         while not self._shutdown.is_set():
             try:
                 now = time.time()
@@ -1343,7 +1512,6 @@ class HyperliquidSniperBot:
                             contract.last_no_mid = float(no_raw)
                         except (ValueError, TypeError):
                             pass
-                    # If only one side present, derive the other.
                     if contract.last_yes_mid is not None and contract.last_no_mid is None:
                         contract.last_no_mid = 1.0 - contract.last_yes_mid
                     elif contract.last_no_mid is not None and contract.last_yes_mid is None:
@@ -1385,7 +1553,6 @@ class HyperliquidSniperBot:
         we're using an agent, otherwise the signer itself). HIP-4 outcomes are
         USDH-collateralized.
         """
-        # Prefer master wallet (agent setup); fall back to signer address.
         master = os.environ.get("HL_ACCOUNT_ADDRESS", "").strip() or None
         addr = master or self._wallet_address
         if not addr:
@@ -1414,7 +1581,182 @@ class HyperliquidSniperBot:
                 existing = self.contracts[c.asset_name]
                 existing.expiry_utc = c.expiry_utc
                 existing.target_price = c.target_price
+        # Recompute desired trade subs (Yes + No coins of every active contract)
+        desired = set()
+        for c in self.contracts.values():
+            desired.add(c.yes_coin)
+            desired.add(c.no_coin)
+        self._desired_trade_coins = desired
         self._last_discovery = time.time()
+
+    # ── Decision pipeline ──
+
+    def _make_decision(self, contract: BinaryContract, vol_estimate: VolEstimate) -> TradeDecision:
+        """
+        Three gates in cheap-to-expensive order:
+          1. Time + statistical (free)
+          2. Volume conviction (local tape data)
+          3. Depth conviction (2 L2 fetches)
+        Each gate's failure short-circuits with a TradeDecision(action=SKIP).
+        """
+        now = datetime.now(timezone.utc)
+        time_left_min = (contract.expiry_utc - now).total_seconds() / 60
+        btc_price = self._btc_price
+        yes_mid = contract.last_yes_mid
+
+        def _skip(reason: str, mode: str = "STAT", **extra) -> TradeDecision:
+            return TradeDecision(
+                timestamp=now, contract=contract.asset_name, btc_price=btc_price,
+                strike=contract.target_price, time_left_min=time_left_min,
+                sigma=vol_estimate.annualized,
+                d_value=extra.get("d_value", 0.0),
+                p_model_yes=extra.get("p_yes", 0.0),
+                market_mid_yes=yes_mid if yes_mid is not None else 0.0,
+                edge=extra.get("edge", 0.0),
+                action="SKIP", reason=reason, mode=mode,
+                min_d_required=extra.get("min_d_required", 0.0),
+                vol_ratio=extra.get("vol_ratio"),
+                vol_ratio_required=extra.get("vol_ratio_required", 0.0),
+                depth_imbalance=extra.get("depth_imbalance"),
+                depth_imb_required=extra.get("depth_imb_required", 0.0),
+            )
+
+        # ── Gate 1a: time window ──
+        if time_left_min <= 0:
+            return _skip("expired")
+        if time_left_min > CONFIG["max_time_left_minutes"]:
+            return _skip(f"time_left={time_left_min:.1f}m > max={CONFIG['max_time_left_minutes']}m")
+        if yes_mid is None or yes_mid <= 0 or yes_mid >= 1:
+            return _skip(f"invalid yes_mid={yes_mid}")
+
+        # ── Gate 1b: statistical ──
+        p_yes, d_val = compute_model_probability(
+            btc_price=btc_price, strike=contract.target_price,
+            time_left_minutes=time_left_min, sigma_annual=vol_estimate.annualized,
+        )
+        p_no = 1.0 - p_yes
+        no_mid = 1.0 - yes_mid
+        edge_yes = p_yes - yes_mid
+        edge_no = p_no - no_mid
+
+        is_pure_flow = time_left_min < CONFIG["pure_flow_time_left_min"]
+        edge_threshold = (
+            CONFIG["pure_flow_edge_threshold"] if is_pure_flow else CONFIG["edge_threshold"]
+        )
+
+        if is_pure_flow:
+            min_d_required = CONFIG["min_d_floor"]
+            # Log pure-flow entry once per contract
+            if not contract.pure_flow_logged:
+                log.info(
+                    f"[{contract.asset_name}] PURE_FLOW_MODE active "
+                    f"(t={time_left_min*60:.0f}s, |d|≥{min_d_required}, edge≥{edge_threshold})"
+                )
+                contract.pure_flow_logged = True
+        else:
+            min_d_required = max(
+                CONFIG["min_d_floor"],
+                CONFIG["min_d_base"] * (time_left_min / CONFIG["max_time_left_minutes"]),
+            )
+
+        intended_side: Optional[str] = None
+        edge: float = 0.0
+        action_pending: str = ""
+        if edge_yes >= edge_threshold and d_val >= min_d_required:
+            intended_side, edge, action_pending = "YES", edge_yes, "BUY_YES"
+        elif edge_no >= edge_threshold and d_val <= -min_d_required:
+            intended_side, edge, action_pending = "NO", edge_no, "BUY_NO"
+        else:
+            reasons = []
+            if abs(d_val) < min_d_required:
+                reasons.append(f"|d|={abs(d_val):.3f} < min_d={min_d_required:.3f}")
+            max_edge = max(edge_yes, edge_no)
+            if max_edge < edge_threshold:
+                reasons.append(f"max_edge={max_edge:.4f} < {edge_threshold}")
+            return _skip(
+                f"STAT_FAIL: {'; '.join(reasons) if reasons else 'no edge'}",
+                mode="PURE_FLOW" if is_pure_flow else "STAT",
+                d_value=d_val, p_yes=p_yes, edge=max_edge, min_d_required=min_d_required,
+            )
+
+        mode = (
+            "PURE_FLOW" if is_pure_flow
+            else ("HYBRID" if abs(d_val) < CONFIG["min_d_base"] else "STAT")
+        )
+
+        # ── Gate 2: conviction thresholds ──
+        if is_pure_flow:
+            vol_ratio_required = CONFIG["volume_ratio_max"]
+            depth_imb_required = CONFIG["depth_imb_max"]
+        else:
+            conf = min(1.0, abs(d_val) / max(1e-6, CONFIG["min_d_base"]))
+            vol_ratio_required = (
+                CONFIG["volume_ratio_max"]
+                - conf * (CONFIG["volume_ratio_max"] - CONFIG["volume_ratio_min"])
+            )
+            depth_imb_required = (
+                CONFIG["depth_imb_max"]
+                - conf * (CONFIG["depth_imb_max"] - CONFIG["depth_imb_min"])
+            )
+
+        favorable_coin = contract.yes_coin if intended_side == "YES" else contract.no_coin
+        unfavorable_coin = contract.no_coin if intended_side == "YES" else contract.yes_coin
+        favorable_mid = yes_mid if intended_side == "YES" else no_mid
+        unfavorable_mid = no_mid if intended_side == "YES" else yes_mid
+
+        # Pure-flow demands fresh tape — refuse to fire on stale data
+        if is_pure_flow and not self.trades_tracker.is_fresh(
+            favorable_coin, max_age_sec=CONFIG["pure_flow_freshness_sec"]
+        ):
+            return _skip(
+                f"PURE_FLOW_NO_FRESH_DATA: no trades on {favorable_coin} "
+                f"in last {CONFIG['pure_flow_freshness_sec']:.0f}s",
+                mode=mode, d_value=d_val, p_yes=p_yes, edge=edge,
+                min_d_required=min_d_required,
+            )
+
+        fav_vol = self.trades_tracker.taker_buy_volume(favorable_coin)
+        unfav_vol = self.trades_tracker.taker_buy_volume(unfavorable_coin)
+        vol_ratio = fav_vol / max(1e-6, unfav_vol)
+
+        if vol_ratio < vol_ratio_required:
+            return _skip(
+                f"STAT_PASS_FLOW_FAIL: vol_ratio={vol_ratio:.2f} < req={vol_ratio_required:.2f} "
+                f"(fav_taker_buy={fav_vol:.2f} unfav_taker_buy={unfav_vol:.2f})",
+                mode=mode, d_value=d_val, p_yes=p_yes, edge=edge,
+                min_d_required=min_d_required,
+                vol_ratio=vol_ratio, vol_ratio_required=vol_ratio_required,
+            )
+
+        # ── Gate 3: depth imbalance (costs 2 L2 fetches) ──
+        fav_depth, unfav_depth, depth_imb = compute_depth_imbalance(
+            self.client, favorable_coin, favorable_mid,
+            unfavorable_coin, unfavorable_mid,
+        )
+
+        if depth_imb is None or depth_imb < depth_imb_required:
+            depth_str = f"{depth_imb:.3f}" if depth_imb is not None else "n/a"
+            return _skip(
+                f"STAT_PASS_FLOW_FAIL: depth_imb={depth_str} < req={depth_imb_required:.3f} "
+                f"(fav_bids={fav_depth:.2f} unfav_bids={unfav_depth:.2f})",
+                mode=mode, d_value=d_val, p_yes=p_yes, edge=edge,
+                min_d_required=min_d_required,
+                vol_ratio=vol_ratio, vol_ratio_required=vol_ratio_required,
+                depth_imbalance=depth_imb, depth_imb_required=depth_imb_required,
+            )
+
+        # ── All gates passed ──
+        return TradeDecision(
+            timestamp=now, contract=contract.asset_name, btc_price=btc_price,
+            strike=contract.target_price, time_left_min=time_left_min,
+            sigma=vol_estimate.annualized,
+            d_value=d_val, p_model_yes=p_yes, market_mid_yes=yes_mid,
+            edge=edge, action=action_pending,
+            reason=f"ALL_GATES_PASS mode={mode} min_d={min_d_required:.3f}",
+            mode=mode, min_d_required=min_d_required,
+            vol_ratio=vol_ratio, vol_ratio_required=vol_ratio_required,
+            depth_imbalance=depth_imb, depth_imb_required=depth_imb_required,
+        )
 
     def _evaluate_all_contracts(self):
         """Evaluate edge on all tracked contracts."""
@@ -1430,7 +1772,6 @@ class HyperliquidSniperBot:
         now = datetime.now(timezone.utc)
 
         for name, contract in list(self.contracts.items()):
-            # Skip already traded contracts
             if contract.traded:
                 continue
 
@@ -1449,28 +1790,17 @@ class HyperliquidSniperBot:
             if contract.last_no_mid is None:
                 contract.last_no_mid = 1.0 - contract.last_yes_mid
 
-            # Skip if yes_mid is invalid
             if contract.last_yes_mid <= 0 or contract.last_yes_mid >= 1:
                 continue
 
             time_left = (contract.expiry_utc - now).total_seconds() / 60
-
-            # Only log detailed evaluations when within 2x the max window
-            if time_left > CONFIG["max_time_left_minutes"] * 2:
+            # Only evaluate when within 2x the max window (saves L2 calls)
+            if time_left > CONFIG["max_time_left_minutes"] * 2 or time_left <= 0:
                 continue
 
-            # Evaluate edge
-            decision = evaluate_edge(
-                contract=contract,
-                btc_price=self._btc_price,
-                yes_mid=contract.last_yes_mid,
-                vol_estimate=vol,
-            )
-
-            # Log the decision
+            decision = self._make_decision(contract, vol)
             self._log_decision(decision)
 
-            # Execute if we have an actionable signal
             if decision.action in ("BUY_YES", "BUY_NO"):
                 self._execute_trade(contract, decision)
 
@@ -1497,8 +1827,6 @@ class HyperliquidSniperBot:
 
         is_buy_yes = decision.action == "BUY_YES"
         coin = contract.yes_coin if is_buy_yes else contract.no_coin
-
-        # entry_price = the side we're buying (Yes mid for BUY_YES, else No mid = 1 - Yes mid)
         current_mid = decision.market_mid_yes if is_buy_yes else (1.0 - decision.market_mid_yes)
 
         # Initial sizing at the mid to choose a depth probe size
@@ -1519,7 +1847,6 @@ class HyperliquidSniperBot:
             log.info(f"Insufficient depth for {contract.asset_name} — skipping")
             return
 
-        # Use the worse of (current_mid, best_ask) — best ask for safety
         entry_price = max(current_mid, best_price) if best_price > 0 else current_mid
 
         # Edge-preservation guard: don't pay above (model_prob - (1-pres)*edge) on the side we're buying
@@ -1549,11 +1876,16 @@ class HyperliquidSniperBot:
 
         log.info("=" * 50)
         log.info(f"EXECUTING TRADE: {decision.action} on {contract.asset_name} (coin={coin})")
+        log.info(f"  Mode={decision.mode}  d={decision.d_value:.3f} (min={decision.min_d_required:.3f})")
         log.info(f"  Equity=${self._equity:.2f}  Risk=${risk_amount:.2f}  "
                  f"(edge_scale={decision.edge / CONFIG['edge_reference']:.2f}x)")
         log.info(f"  BTC={decision.btc_price:.2f}  K={decision.strike:.2f}")
         log.info(f"  P_model={decision.p_model_yes:.4f}  YesMid={decision.market_mid_yes:.4f}")
-        log.info(f"  Edge={decision.edge:.4f}  d={decision.d_value:.3f}")
+        log.info(f"  Edge={decision.edge:.4f}")
+        if decision.vol_ratio is not None:
+            log.info(f"  VolRatio={decision.vol_ratio:.2f} (req {decision.vol_ratio_required:.2f})")
+        if decision.depth_imbalance is not None:
+            log.info(f"  DepthImb={decision.depth_imbalance:.3f} (req {decision.depth_imb_required:.3f})")
         log.info(f"  Entry=${entry_price:.4f}  Shares={shares}")
         log.info("=" * 50)
 
@@ -1583,30 +1915,40 @@ class HyperliquidSniperBot:
     def _cleanup_expired(self):
         """Remove expired contracts from tracking."""
         now = datetime.now(timezone.utc)
-        expired = [
-            name for name, c in self.contracts.items()
-            if c.expiry_utc <= now
-        ]
+        expired = [name for name, c in self.contracts.items() if c.expiry_utc <= now]
         for name in expired:
             c = self.contracts.pop(name)
             if c.traded:
                 self.open_positions = max(0, self.open_positions - 1)
             log.info(f"Removed expired contract: {name}")
+        if expired:
+            # Recompute desired subs so the WS sub-manager unsubscribes
+            desired = set()
+            for c in self.contracts.values():
+                desired.add(c.yes_coin)
+                desired.add(c.no_coin)
+            self._desired_trade_coins = desired
 
     def _log_decision(self, d: TradeDecision):
         """Log a trade decision with full parameters."""
         level = logging.INFO if d.action != "SKIP" else logging.DEBUG
-        # Always log at INFO when close to expiry
         if d.time_left_min <= CONFIG["max_time_left_minutes"]:
             level = logging.INFO
 
-        log.log(
-            level,
-            f"[{d.contract}] BTC={d.btc_price:.2f} K={d.strike:.2f} "
-            f"t={d.time_left_min:.1f}m σ={d.sigma:.4f} d={d.d_value:.3f} "
-            f"P={d.p_model_yes:.4f} mid={d.market_mid_yes:.4f} "
-            f"edge={d.edge:.4f} -> {d.action} ({d.reason})"
-        )
+        parts = [
+            f"[{d.contract}]", f"mode={d.mode}",
+            f"BTC={d.btc_price:.2f}", f"K={d.strike:.2f}",
+            f"t={d.time_left_min:.2f}m", f"σ={d.sigma:.4f}",
+            f"d={d.d_value:.3f}/min={d.min_d_required:.3f}",
+            f"P={d.p_model_yes:.4f}", f"mid={d.market_mid_yes:.4f}",
+            f"edge={d.edge:.4f}",
+        ]
+        if d.vol_ratio is not None:
+            parts.append(f"vr={d.vol_ratio:.2f}/{d.vol_ratio_required:.2f}")
+        if d.depth_imbalance is not None:
+            parts.append(f"di={d.depth_imbalance:.3f}/{d.depth_imb_required:.3f}")
+        parts.append(f"-> {d.action} ({d.reason})")
+        log.log(level, " ".join(parts))
 
 
 # =============================================================================
@@ -1614,7 +1956,6 @@ class HyperliquidSniperBot:
 # =============================================================================
 
 def main():
-    # Load private key from environment
     private_key = os.environ.get("HYPERLIQUID_PRIVATE_KEY", "")
 
     if not private_key:
@@ -1642,14 +1983,10 @@ if __name__ == "__main__":
 # TODO: Optional improvements
 # =============================================================================
 # TODO: Add backtesting framework — replay historical binary outcomes and
-#       evaluate model accuracy + PnL.
-# TODO: Add risk limits — max daily loss, max total exposure, cool-down
-#       after consecutive losses.
-# TODO: Support multiple outcomes in parallel (e.g., ETH binaries, hourly).
-# TODO: Add Telegram/Discord notifications for trades and daily PnL.
-# TODO: Implement Kelly criterion for dynamic position sizing based on edge.
-# TODO: Add a simple web dashboard (Flask/FastAPI) for monitoring.
-# TODO: Track and log actual settlement outcomes for model calibration.
-# TODO: Use candle WebSocket subscription instead of REST polling for vol.
-# TODO: Add circuit breaker if BTC vol spikes dramatically (>3x normal).
+#       evaluate model + conviction-gate accuracy + PnL.
+# TODO: REST-based recent-trades polling so polling-fallback mode can still
+#       compute taker-buy volume (currently flow-blind in fallback).
+# TODO: Telegram/Discord notifications for trades and daily PnL.
+# TODO: Track and log actual settlement outcomes for model + conviction calibration.
 # TODO: Implement partial fill handling and order amendment logic.
+# TODO: Add circuit breaker if BTC vol spikes dramatically (>3x normal).
