@@ -119,6 +119,7 @@ CONFIG = {
     "active_poll_interval_sec": _env_int("ACTIVE_POLL_INTERVAL_SEC", 2),
     "vol_refresh_sec":         _env_int("VOL_REFRESH_SEC", 60),
     "ws_reconnect_delay_sec":  _env_int("WS_RECONNECT_DELAY_SEC", 5),
+    "ws_ping_interval_sec":    _env_int("WS_PING_INTERVAL_SEC", 30),
     "heartbeat_sec":           _env_int("HEARTBEAT_SEC", 300),
 
     # ── Logging ──
@@ -574,6 +575,21 @@ class VolatilityCalculator:
         """Add a 1-minute price observation."""
         self.prices.append((timestamp, price))
         # Keep last 120 minutes of data
+        cutoff = timestamp - 120 * 60
+        self.prices = [(t, p) for t, p in self.prices if t >= cutoff]
+
+    def set_price(self, timestamp: float, price: float):
+        """
+        Streaming-candle ingestion: a 1m candle gets multiple WS messages as
+        it forms. Dedupe by timestamp so we update the in-progress candle
+        rather than appending duplicates.
+        """
+        if not (price > 0):
+            return
+        if self.prices and self.prices[-1][0] == timestamp:
+            self.prices[-1] = (timestamp, price)
+            return
+        self.prices.append((timestamp, price))
         cutoff = timestamp - 120 * 60
         self.prices = [(t, p) for t, p in self.prices if t >= cutoff]
 
@@ -1113,9 +1129,9 @@ class HyperliquidSniperBot:
 
     async def _run_async(self):
         """Main async loop using WebSocket for real-time price updates."""
-        # Initial setup
+        # Initial setup — bootstrap vol from REST (with retry); WS candle feed takes over.
         self._refresh_btc_price()
-        self._refresh_volatility()
+        await self._bootstrap_volatility()
         self._refresh_equity()
         self._discover_contracts()
 
@@ -1131,8 +1147,12 @@ class HyperliquidSniperBot:
                     self._discover_contracts()
                     self._last_discovery = now
 
-                # Periodic volatility refresh
-                if now - self._last_vol_update >= CONFIG["vol_refresh_sec"]:
+                # Vol fallback: only fire REST if WS candle feed has gone stale (>5min).
+                vol_stale = (
+                    not self.vol_calc.prices
+                    or time.time() - self.vol_calc.prices[-1][0] > 300
+                )
+                if vol_stale and now - self._last_vol_update >= CONFIG["vol_refresh_sec"]:
                     self._refresh_volatility()
                     self._last_vol_update = now
 
@@ -1163,22 +1183,28 @@ class HyperliquidSniperBot:
             log.info("Bot shutdown complete.")
 
     async def _ws_listener(self):
-        """WebSocket listener for real-time allMids updates."""
+        """WebSocket listener: streams allMids + BTC 1m candles; sends app-level pings."""
         while not self._shutdown.is_set():
+            ping_task = None
             try:
                 async with websockets.connect(
                     CONFIG["ws_url"],
                     ping_interval=20,
-                    ping_timeout=10,
+                    ping_timeout=None,  # rely on HL app-level ping; don't kill conn on missing protocol pong
                     close_timeout=5,
                 ) as ws:
-                    # Subscribe to allMids
-                    sub_msg = {
+                    await ws.send(json.dumps({
                         "method": "subscribe",
-                        "subscription": {"type": "allMids"}
-                    }
-                    await ws.send(json.dumps(sub_msg))
-                    log.info("WebSocket connected — subscribed to allMids")
+                        "subscription": {"type": "allMids"},
+                    }))
+                    await ws.send(json.dumps({
+                        "method": "subscribe",
+                        "subscription": {"type": "candle", "coin": "BTC", "interval": "1m"},
+                    }))
+                    log.info("WebSocket connected — subscribed to allMids + candle@BTC@1m")
+
+                    # HL closes idle connections at 60s; send {"method":"ping"} every 30s.
+                    ping_task = asyncio.create_task(self._ws_ping_loop(ws))
 
                     async for raw_msg in ws:
                         if self._shutdown.is_set():
@@ -1193,9 +1219,29 @@ class HyperliquidSniperBot:
                 log.warning(f"WebSocket closed: {e} — reconnecting in {CONFIG['ws_reconnect_delay_sec']}s")
             except Exception as e:
                 log.warning(f"WebSocket error: {e} — reconnecting in {CONFIG['ws_reconnect_delay_sec']}s")
+            finally:
+                if ping_task is not None and not ping_task.done():
+                    ping_task.cancel()
+                    try:
+                        await ping_task
+                    except asyncio.CancelledError:
+                        pass
 
             if not self._shutdown.is_set():
                 await asyncio.sleep(CONFIG["ws_reconnect_delay_sec"])
+
+    async def _ws_ping_loop(self, ws):
+        """Send {'method':'ping'} every WS_PING_INTERVAL_SEC. HL idle timeout is 60s."""
+        try:
+            while not self._shutdown.is_set():
+                await asyncio.sleep(CONFIG["ws_ping_interval_sec"])
+                if self._shutdown.is_set():
+                    return
+                await ws.send(json.dumps({"method": "ping"}))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.debug(f"Ping loop ended: {e}")
 
     def _handle_ws_message(self, msg: dict):
         """Process incoming WebSocket messages."""
@@ -1214,6 +1260,26 @@ class HyperliquidSniperBot:
                         except (ValueError, TypeError):
                             pass
                         break
+        elif channel == "candle":
+            # Server sends Candle | Candle[]; handle both shapes.
+            items = data if isinstance(data, list) else [data]
+            for c in items:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("s") != "BTC" or c.get("i") != "1m":
+                    continue
+                try:
+                    t_ms = c.get("T")
+                    close = c.get("c")
+                    if t_ms is None or close is None:
+                        continue
+                    self.vol_calc.set_price(float(t_ms) / 1000.0, float(close))
+                except (ValueError, TypeError):
+                    continue
+        elif channel == "pong":
+            return  # heartbeat ack
+        elif channel == "subscriptionResponse":
+            return  # subscribe ack
 
     # ── Polling fallback ──
 
@@ -1286,11 +1352,32 @@ class HyperliquidSniperBot:
             log.debug(f"Price refresh failed: {e}")
 
     def _refresh_volatility(self):
-        """Update BTC volatility estimate from recent candles."""
+        """Update BTC volatility estimate from recent candles (REST fallback path)."""
         candles = self.client.get_candles("BTC", interval="1m", lookback=120)
         if candles:
             self.vol_calc.load_from_candles(candles)
         self._last_vol_update = time.time()
+
+    async def _bootstrap_volatility(self, max_attempts: int = 3):
+        """
+        One-shot REST candle fetch at startup with backoff. WS candle feed
+        takes over from here, so we only need ~5 closed candles before the
+        feed warms up; even a partial bootstrap is fine.
+        """
+        for attempt in range(1, max_attempts + 1):
+            candles = self.client.get_candles("BTC", interval="1m", lookback=120)
+            if candles:
+                self.vol_calc.load_from_candles(candles)
+                self._last_vol_update = time.time()
+                log.info(f"Vol bootstrap: loaded {len(self.vol_calc.prices)} candles from REST")
+                return
+            delay = 5 * attempt
+            log.warning(
+                f"Vol bootstrap attempt {attempt}/{max_attempts} got no candles "
+                f"(likely 429) — retry in {delay}s"
+            )
+            await asyncio.sleep(delay)
+        log.warning("Vol bootstrap failed all attempts — relying on WS candle feed to fill")
 
     def _refresh_equity(self):
         """
