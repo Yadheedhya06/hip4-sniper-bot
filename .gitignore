@@ -10,3 +10,5 @@ dist/
 build/
 .idea/
 .vscode/
+.claude/
+daily_state.json

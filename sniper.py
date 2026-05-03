@@ -22,6 +22,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
 
 import numpy as np
@@ -30,45 +31,110 @@ import websockets
 import asyncio
 from scipy.stats import norm
 
+# Load .env if present (no-op in prod where env vars come from Railway)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+
+def _env_float(key: str, default: float) -> float:
+    raw = os.environ.get(key, "")
+    if raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(key: str, default: int) -> int:
+    raw = os.environ.get(key, "")
+    if raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    raw = os.environ.get(key, "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _env_opt_float(key: str) -> Optional[float]:
+    raw = os.environ.get(key, "").strip()
+    if raw == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
 # =============================================================================
 # CONFIGURATION — adjust these to your risk tolerance
 # =============================================================================
 
 CONFIG = {
-    # ── Position sizing ──
-    "position_size_usd": 25,           # max USD per trade (start small!)
-    "max_open_positions": 3,            # max concurrent positions across contracts
+    # ── Risk model (env-overridable) ──
+    "base_risk_pct":       _env_float("SIZE_PCT_OF_EQUITY", 0.05),   # 5% of equity baseline
+    "max_risk_pct":        _env_float("SIZE_MAX_PCT_OF_EQUITY", 0.10),
+    "min_trade_usd":       _env_float("SIZE_MIN_USD", 10),
+    "max_trade_usd":       _env_float("SIZE_MAX_USD", 200),
+    "edge_reference":      _env_float("EDGE_REFERENCE", 0.10),
+    "max_open_positions":  _env_int("MAX_OPEN_POSITIONS", 3),
+    "equity_refresh_sec":  _env_int("EQUITY_REFRESH_SEC", 30),
+
+    # Training-wheels: hard cap per-trade USD regardless of equity. Empty = disabled.
+    "training_wheels_max_usd": _env_opt_float("TRAINING_WHEELS_MAX_USD"),
+    "equity_floor_usd":    _env_float("EQUITY_FLOOR_USD", 50),
+
+    # ── Daily loss kill-switch ──
+    "daily_loss_limit_pct": _env_float("DAILY_LOSS_LIMIT_PCT", 0.10),  # 10% of day-start
+    "daily_state_file":    os.environ.get("DAILY_STATE_FILE", "daily_state.json"),
 
     # ── Edge & entry thresholds ──
-    "edge_threshold": 0.10,             # min edge (model_prob - market_mid) to trade
-    "min_abs_d": 1.8,                   # min |d| for entry (~96%+ model prob)
-    "max_time_left_minutes": 5.0,       # only trade when ≤ this many minutes remain
-    "ideal_time_left_minutes": 3.0,     # preferred entry window
+    "edge_threshold":      _env_float("EDGE_THRESHOLD", 0.10),
+    "min_abs_d":           _env_float("MIN_ABS_D", 1.8),
+    "max_time_left_minutes": _env_float("MAX_TIME_LEFT_MIN", 5.0),
+    "ideal_time_left_minutes": _env_float("IDEAL_TIME_LEFT_MIN", 3.0),
 
     # ── Volatility estimation ──
-    "vol_windows": [15, 30, 60],        # lookback windows in minutes for vol calc
-    "vol_multiplier": 1.3,             # conservatism multiplier on realized vol
-    "min_vol_annualized": 0.30,        # floor on annualized vol (30%)
+    "vol_windows": [15, 30, 60],
 
     # ── Orderbook & execution ──
-    "max_slippage_pct": 0.03,          # max 3% slippage on entry
-    "edge_preservation_min": 0.80,     # order price must preserve ≥80% of edge
-    "use_limit_orders": True,          # True=limit, False=IOC market
+    "max_slippage_pct":     _env_float("MAX_SLIPPAGE_PCT", 0.03),
+    "edge_preservation_min": _env_float("EDGE_PRESERVATION_MIN", 0.80),
+    "use_limit_orders":     _env_bool("USE_LIMIT_ORDERS", True),
 
     # ── Discovery & polling ──
-    "discovery_interval_sec": 30,      # how often to scan for new contracts
-    "price_poll_interval_sec": 2,      # how often to refresh BTC price (fallback)
-    "ws_reconnect_delay_sec": 5,       # delay before WS reconnect
+    "discovery_interval_sec":  _env_int("DISCOVERY_INTERVAL_SEC", 30),
+    "price_poll_interval_sec": _env_int("PRICE_POLL_INTERVAL_SEC", 2),
+    "ws_reconnect_delay_sec":  _env_int("WS_RECONNECT_DELAY_SEC", 5),
+    "heartbeat_sec":           _env_int("HEARTBEAT_SEC", 60),
 
     # ── Logging ──
-    "log_to_file": True,
-    "log_file": "sniper.log",
-    "log_level": "INFO",
+    "log_to_file":   _env_bool("LOG_TO_FILE", False),   # default off in prod
+    "log_to_stdout": _env_bool("LOG_TO_STDOUT", True),
+    "log_file":      os.environ.get("LOG_FILE", "sniper.log"),
+    "log_level":     os.environ.get("LOG_LEVEL", "INFO"),
+
+    # ── HTTP healthcheck (Railway expects $PORT) ──
+    "health_port": _env_int("PORT", 8080),
+
+    # ── Trading toggle (set DRY_RUN=true to log decisions but never sign) ──
+    "dry_run": _env_bool("DRY_RUN", False),
 
     # ── API endpoints ──
-    "rest_url": "https://api.hyperliquid.xyz/info",
-    "ws_url": "wss://api.hyperliquid.xyz/ws",
-    "exchange_url": "https://api.hyperliquid.xyz/exchange",
+    "rest_url":     os.environ.get("HL_REST_URL", "https://api.hyperliquid.xyz/info"),
+    "ws_url":       os.environ.get("HL_WS_URL",   "wss://api.hyperliquid.xyz/ws"),
+    "exchange_url": os.environ.get("HL_EXCHANGE_URL", "https://api.hyperliquid.xyz/exchange"),
 }
 
 # Minutes in a year for T conversion
@@ -83,13 +149,13 @@ def setup_logging() -> logging.Logger:
     logger.setLevel(getattr(logging, CONFIG["log_level"]))
     fmt = logging.Formatter(
         "[%(asctime)s] %(levelname)-7s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
+        datefmt="%Y-%m-%dT%H:%M:%SZ"
     )
-    # Console handler
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
-    # Optional file handler
+    fmt.converter = time.gmtime  # always log in UTC
+    if CONFIG["log_to_stdout"]:
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
     if CONFIG["log_to_file"]:
         fh = logging.FileHandler(CONFIG["log_file"])
         fh.setFormatter(fmt)
@@ -104,15 +170,19 @@ log = setup_logging()
 
 @dataclass
 class BinaryContract:
-    """Represents a single BTC priceBinary outcome contract."""
-    asset_name: str               # e.g. "BTC-BINARY-20260503-78213"
-    asset_index: int              # index in the universe array
+    """A single BTC priceBinary outcome (HIP-4). Carries both Yes and No coins."""
+    asset_name: str               # synthetic id, e.g. "BTC-BINARY-20260504-78443"
+    outcome_id: int               # the `outcome` field from outcomeMeta
+    yes_coin: str                 # "#<10*outcome+0>"  e.g. "#0"
+    no_coin: str                  # "#<10*outcome+1>"  e.g. "#1"
+    yes_asset_id: int             # 100_000_000 + 10*outcome + 0
+    no_asset_id: int              # 100_000_000 + 10*outcome + 1
     underlying: str               # "BTC"
     target_price: float           # strike price
     expiry_utc: datetime          # expiry as UTC datetime
     period: str                   # "1d", "1h", etc.
-    raw_description: str          # full metadata string
-    traded: bool = False          # whether we already traded this
+    raw_description: str
+    traded: bool = False
     last_yes_mid: Optional[float] = None
     last_no_mid: Optional[float] = None
 
@@ -157,6 +227,7 @@ class HyperliquidClient:
         self.exchange_url = CONFIG["exchange_url"]
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
+        self._exchange = None  # lazily built by _ensure_exchange
 
         # Try to import and use the SDK for order placement
         self._sdk_exchange = None
@@ -184,9 +255,9 @@ class HyperliquidClient:
         resp.raise_for_status()
         return resp.json()
 
-    def get_meta_and_asset_ctxs(self) -> dict:
-        """Fetch full metadata + asset contexts."""
-        return self._post_info({"type": "metaAndAssetCtxs"})
+    def get_outcome_meta(self) -> dict:
+        """Fetch HIP-4 outcome metadata. Shape: {outcomes:[{outcome,name,description,sideSpecs:[…]}], questions:[…]}."""
+        return self._post_info({"type": "outcomeMeta"})
 
     def get_all_mids(self) -> dict:
         """Fetch current mid prices for all assets."""
@@ -195,6 +266,26 @@ class HyperliquidClient:
     def get_l2_book(self, coin: str) -> dict:
         """Fetch L2 orderbook for a specific coin."""
         return self._post_info({"type": "l2Book", "coin": coin})
+
+    def get_user_state(self, address: str) -> dict:
+        """Fetch perp clearinghouse state — includes marginSummary.accountValue (equity)."""
+        return self._post_info({"type": "clearinghouseState", "user": address})
+
+    def get_spot_state(self, address: str) -> dict:
+        """Fetch spot clearinghouse state. Contains balances[] keyed by coin (USDH, USDC, …)."""
+        return self._post_info({"type": "spotClearinghouseState", "user": address})
+
+    def get_usdh_balance(self, address: str) -> float:
+        """Return spot USDH balance for the given address (HIP-4 collateral)."""
+        state = self.get_spot_state(address)
+        balances = state.get("balances", []) if isinstance(state, dict) else []
+        for b in balances:
+            if b.get("coin") == "USDH":
+                try:
+                    return float(b.get("total", 0) or 0)
+                except (ValueError, TypeError):
+                    return 0.0
+        return 0.0
 
     def get_candles(self, coin: str, interval: str = "1m", lookback: int = 60) -> list:
         """
@@ -219,10 +310,64 @@ class HyperliquidClient:
             return []
 
     # ── Order placement ──
-    # NOTE: Full order placement requires signing with the private key.
-    # The SDK's Exchange class handles this. Below is the structure for
-    # placing orders — you must ensure the SDK is properly initialized
-    # with your wallet/private key.
+    # The SDK's Exchange class handles signing. Two HIP-4-specific quirks:
+    #   1. The SDK shipped name_to_asset only knows spot+perp, so we inject
+    #      outcome coins ("#<10*outcome+side>") into its lookup tables.
+    #   2. Newer SDKs (>=0.10) use positional args; `coin=` kwarg is gone.
+
+    def _ensure_exchange(self):
+        """Lazily build and cache the SDK Exchange instance with agent-wallet routing."""
+        if getattr(self, "_exchange", None) is not None:
+            return self._exchange
+        from hyperliquid.exchange import Exchange
+        from hyperliquid.utils import constants
+        import eth_account
+
+        account = eth_account.Account.from_key(self.private_key)
+        master = os.environ.get("HL_ACCOUNT_ADDRESS", "").strip() or None
+        self._exchange = Exchange(
+            wallet=account,
+            base_url=constants.MAINNET_API_URL,
+            account_address=master,
+        )
+        return self._exchange
+
+    @staticmethod
+    def _maybe_inject_outcome(exchange, coin: str) -> None:
+        """If coin is a HIP-4 outcome ("#<encoding>"), register asset id in SDK lookup tables."""
+        if not (isinstance(coin, str) and coin.startswith("#")):
+            return
+        try:
+            encoding = int(coin[1:])
+        except ValueError:
+            return
+        asset_id = 100_000_000 + encoding
+        exchange.info.name_to_coin[coin] = coin
+        exchange.info.coin_to_asset[coin] = asset_id
+
+    @staticmethod
+    def _parse_order_response(coin: str, result: dict) -> dict:
+        """Convert HL's nested order response into a flat dict; surface embedded errors."""
+        if not isinstance(result, dict):
+            return {"error": f"unexpected_response_type:{type(result).__name__}"}
+        try:
+            statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+        except Exception:
+            statuses = []
+        for s in statuses:
+            if isinstance(s, dict):
+                if "error" in s:
+                    return {"error": f"hl_rejected:{s['error']}"}
+                if "resting" in s:
+                    return {"resting_oid": s["resting"].get("oid"), "raw": result}
+                if "filled" in s:
+                    return {
+                        "filled_oid": s["filled"].get("oid"),
+                        "fill_sz": s["filled"].get("totalSz"),
+                        "fill_px": s["filled"].get("avgPx"),
+                        "raw": result,
+                    }
+        return {"raw": result}
 
     def place_limit_order(
         self,
@@ -232,43 +377,46 @@ class HyperliquidClient:
         price: float,
         reduce_only: bool = False,
     ) -> dict:
-        """
-        Place a limit order on a binary outcome token.
-
-        For HIP-4 binary tokens:
-        - Buy Yes token = go long on the Yes coin
-        - Buy No token = go long on the No coin (or short Yes, depending on structure)
-
-        Returns the order response dict.
-        """
+        """Place a HIP-4 outcome limit order. For HIP-4: coin like "#10" or "#11"."""
         try:
-            from hyperliquid.exchange import Exchange
-            from hyperliquid.utils import constants
-            import eth_account
-
-            account = eth_account.Account.from_key(self.private_key)
-            exchange = Exchange(
-                wallet=account,
-                base_url=constants.MAINNET_API_URL,
-            )
-
+            exchange = self._ensure_exchange()
+            self._maybe_inject_outcome(exchange, coin)
             order_result = exchange.order(
-                coin=coin,
-                is_buy=is_buy,
-                sz=size,
-                limit_px=price,
-                order_type={"limit": {"tif": "Gtc"}},
-                reduce_only=reduce_only,
+                coin,                            # name (positional)
+                bool(is_buy),
+                float(size),
+                float(price),
+                {"limit": {"tif": "Gtc"}},
+                bool(reduce_only),
             )
-            log.info(f"Order placed: {coin} {'BUY' if is_buy else 'SELL'} "
-                     f"size={size} price={price} -> {order_result}")
-            return order_result
+            parsed = self._parse_order_response(coin, order_result)
+            log.info(
+                f"Order {'placed' if 'error' not in parsed else 'REJECTED'}: "
+                f"{coin} {'BUY' if is_buy else 'SELL'} size={size} px={price} -> {parsed}"
+            )
+            return parsed
 
         except ImportError:
-            log.error("eth_account or hyperliquid SDK not available for signing")
-            return self._place_order_raw(coin, is_buy, size, price)
+            log.error("hyperliquid SDK not available for signing")
+            return {"error": "sdk_unavailable"}
+        except KeyError as e:
+            log.error(
+                f"SDK could not resolve coin '{coin}' (KeyError: {e}). "
+                f"asset_id should be 100_000_000 + 10*outcome + side"
+            )
+            return {"error": f"sdk_unknown_coin:{coin}"}
         except Exception as e:
-            log.error(f"Order placement failed: {e}")
+            log.error(f"Order placement failed for coin={coin}: {e}", exc_info=True)
+            return {"error": str(e)}
+
+    def cancel_order(self, coin: str, oid: int) -> dict:
+        """Cancel an existing HIP-4 outcome order by oid."""
+        try:
+            exchange = self._ensure_exchange()
+            self._maybe_inject_outcome(exchange, coin)
+            return exchange.cancel(coin, oid)
+        except Exception as e:
+            log.error(f"Cancel failed for {coin} oid={oid}: {e}", exc_info=True)
             return {"error": str(e)}
 
     def _place_order_raw(self, coin: str, is_buy: bool, size: float, price: float) -> dict:
@@ -324,75 +472,81 @@ def parse_binary_description(desc: str) -> Optional[dict]:
         return None
 
 
-def discover_btc_binaries(client: HyperliquidClient) -> list[BinaryContract]:
+OUTCOME_ASSET_BASE = 100_000_000  # exchange asset id base for outcome assets
+
+
+def _outcome_coin(outcome_id: int, side: int) -> str:
+    """HIP-4 outcome coin string used by /info?l2Book and allMids."""
+    return f"#{10 * outcome_id + side}"
+
+
+def _outcome_asset_id(outcome_id: int, side: int) -> int:
+    """Numeric asset id for /exchange order action: 100_000_000 + 10*outcome + side."""
+    return OUTCOME_ASSET_BASE + 10 * outcome_id + side
+
+
+def discover_btc_binaries(client: "HyperliquidClient") -> list[BinaryContract]:
     """
-    Scan the Hyperliquid universe for active BTC priceBinary contracts.
-    Returns a list of BinaryContract objects for contracts not yet expired.
+    Scan HIP-4 outcomeMeta for active BTC priceBinary contracts not yet expired.
+    Each outcome has two coins (#<10*o+0>=Yes, #<10*o+1>=No); we model one
+    BinaryContract per outcome and carry both coin ids.
     """
-    contracts = []
+    contracts: list[BinaryContract] = []
     now = datetime.now(timezone.utc)
 
     try:
-        data = client.get_meta_and_asset_ctxs()
+        data = client.get_outcome_meta()
     except Exception as e:
-        log.error(f"Failed to fetch metaAndAssetCtxs: {e}")
+        log.error(f"Failed to fetch outcomeMeta: {e}")
         return contracts
 
-    # data is typically [meta, assetCtxs] — meta contains universe array
-    if not isinstance(data, list) or len(data) < 2:
-        log.warning(f"Unexpected metaAndAssetCtxs format: {type(data)}")
-        return contracts
+    outcomes = data.get("outcomes", []) if isinstance(data, dict) else []
 
-    meta = data[0]
-    universe = meta.get("universe", [])
-
-    for idx, asset in enumerate(universe):
-        name = asset.get("name", "")
-        # The description may be in the asset dict or in a separate field
-        # Try multiple possible locations for the description
-        desc = (
-            asset.get("description", "")
-            or asset.get("szDecimals", "")  # sometimes embedded
-            or name
-        )
-
-        # Also check if the name itself contains priceBinary info
-        # or if there's an 'extra' or 'info' field
-        for field_name in ["description", "extra", "info", "className"]:
-            if field_name in asset:
-                candidate = str(asset[field_name])
-                if "priceBinary" in candidate and "BTC" in candidate:
-                    desc = candidate
-                    break
-
-        # Try parsing the description
+    for entry in outcomes:
+        try:
+            outcome_id = int(entry.get("outcome"))
+        except (TypeError, ValueError):
+            continue
+        desc = entry.get("description", "") or ""
         parsed = parse_binary_description(desc)
         if parsed is None:
-            # Also try the asset name — some formats encode info there
-            parsed = parse_binary_description(name)
-        if parsed is None:
             continue
-
-        # Skip expired contracts
         if parsed["expiry_utc"] <= now:
             continue
 
-        contract = BinaryContract(
-            asset_name=name,
-            asset_index=idx,
+        # Sanity: HIP-4 sideSpecs should be exactly [Yes, No] in that order.
+        sides = entry.get("sideSpecs", [])
+        if len(sides) != 2:
+            log.warning(f"outcome={outcome_id} has {len(sides)} sides, expected 2 — skipping")
+            continue
+
+        expiry_tag = parsed["expiry_utc"].strftime("%Y%m%d-%H%M")
+        synthetic_name = (
+            f"BTC-BINARY-{expiry_tag}-{int(parsed['target_price'])}"
+        )
+
+        contracts.append(BinaryContract(
+            asset_name=synthetic_name,
+            outcome_id=outcome_id,
+            yes_coin=_outcome_coin(outcome_id, 0),
+            no_coin=_outcome_coin(outcome_id, 1),
+            yes_asset_id=_outcome_asset_id(outcome_id, 0),
+            no_asset_id=_outcome_asset_id(outcome_id, 1),
             underlying=parsed["underlying"],
             target_price=parsed["target_price"],
             expiry_utc=parsed["expiry_utc"],
             period=parsed["period"],
             raw_description=desc,
-        )
-        contracts.append(contract)
+        ))
 
     log.info(f"Discovered {len(contracts)} active BTC priceBinary contracts")
     for c in contracts:
         time_left = (c.expiry_utc - now).total_seconds() / 60
-        log.info(f"  {c.asset_name} | strike={c.target_price} | "
-                 f"expiry={c.expiry_utc.isoformat()} | {time_left:.1f}min left")
+        log.info(
+            f"  {c.asset_name} outcome={c.outcome_id} yes={c.yes_coin} no={c.no_coin} "
+            f"strike={c.target_price} expiry={c.expiry_utc.isoformat()} "
+            f"t_left={time_left:.1f}min"
+        )
 
     return contracts
 
@@ -403,14 +557,14 @@ def discover_btc_binaries(client: HyperliquidClient) -> list[BinaryContract]:
 
 class VolatilityCalculator:
     """
-    Calculates annualized realized volatility from 1-minute BTC log returns.
-    Uses multiple lookback windows and takes the conservative (max) estimate.
+    Annualized realized volatility from 1-minute BTC log returns.
+
+    Spec: σ = MAX of realized annualized vol across {15, 30, 60}-minute windows.
+    Taking the max across windows is itself the conservatism — no multiplier.
     """
 
-    def __init__(self, windows: list[int] = None, multiplier: float = 1.3):
+    def __init__(self, windows: list[int] = None):
         self.windows = windows or CONFIG["vol_windows"]
-        self.multiplier = multiplier
-        self.min_vol = CONFIG["min_vol_annualized"]
         # Store recent 1-minute close prices
         self.prices: list[tuple[float, float]] = []  # (timestamp, price)
 
@@ -440,8 +594,7 @@ class VolatilityCalculator:
 
     def calculate(self) -> Optional[VolEstimate]:
         """
-        Calculate annualized realized volatility.
-        Uses multiple windows, takes the max, and multiplies by conservatism factor.
+        σ = max over windows of stdev(1m log returns) * √(minutes per year).
         """
         if len(self.prices) < 5:
             log.warning(f"Not enough price data for vol calc ({len(self.prices)} points)")
@@ -455,15 +608,11 @@ class VolatilityCalculator:
         best_n = 0
 
         for window in self.windows:
-            # Use the last `window` returns
             returns = all_log_returns[-window:] if len(all_log_returns) >= window else all_log_returns
             if len(returns) < 3:
                 continue
 
-            # Standard deviation of 1-minute log returns
             std_1m = np.std(returns, ddof=1)
-
-            # Annualize: multiply by sqrt(minutes per year)
             annualized = std_1m * math.sqrt(MINUTES_PER_YEAR)
 
             if annualized > best_vol:
@@ -471,17 +620,16 @@ class VolatilityCalculator:
                 best_window = window
                 best_n = len(returns)
 
-        # Apply conservatism multiplier
-        final_vol = max(best_vol * self.multiplier, self.min_vol)
+        if best_vol <= 0:
+            return None
 
         estimate = VolEstimate(
-            annualized=final_vol,
+            annualized=best_vol,
             window_minutes=best_window,
             num_returns=best_n,
             timestamp=datetime.now(timezone.utc),
         )
-        log.debug(f"Vol estimate: {final_vol:.4f} (window={best_window}m, "
-                  f"n={best_n}, raw_max={best_vol:.4f})")
+        log.debug(f"Vol estimate: σ={best_vol:.4f} (window={best_window}m, n={best_n})")
         return estimate
 
 
@@ -610,6 +758,52 @@ def evaluate_edge(
 
 
 # =============================================================================
+# POSITION SIZING & RISK MANAGEMENT
+# =============================================================================
+#
+# Spec (implement exactly):
+#   base_risk  = equity * BASE_RISK_PCT
+#   edge_scale = edge / EDGE_REFERENCE                 # e.g. 0.12 edge -> 1.2x
+#   risk_amount = base_risk * min(2.0, max(0.6, edge_scale))
+#   risk_amount = max(MIN_TRADE_USD,
+#                     min(risk_amount, equity * MAX_RISK_PCT, MAX_TRADE_USD))
+#   shares = floor(risk_amount / entry_price)
+
+
+def compute_position_size(
+    equity: float,
+    edge: float,
+    entry_price: float,
+) -> tuple[float, int]:
+    """
+    Returns (risk_amount_usd, shares) for a trade given current equity, the
+    magnitude of the edge (|P_model - market_mid|), and the entry price per
+    share (current_mid or best ask).
+    """
+    if equity <= 0 or entry_price <= 0:
+        return 0.0, 0
+
+    base = CONFIG["base_risk_pct"]
+    max_pct = CONFIG["max_risk_pct"]
+    min_usd = CONFIG["min_trade_usd"]
+    max_usd = CONFIG["max_trade_usd"]
+    edge_ref = CONFIG["edge_reference"]
+
+    base_risk = equity * base
+    edge_scale = edge / edge_ref if edge_ref > 0 else 1.0
+    risk_amount = base_risk * min(2.0, max(0.6, edge_scale))
+    risk_amount = max(min_usd, min(risk_amount, equity * max_pct, max_usd))
+
+    # Training-wheels: hard cap regardless of equity, only if configured.
+    tw = CONFIG.get("training_wheels_max_usd")
+    if tw is not None and tw > 0:
+        risk_amount = min(risk_amount, tw)
+
+    shares = math.floor(risk_amount / entry_price)
+    return risk_amount, shares
+
+
+# =============================================================================
 # ORDERBOOK ANALYSIS
 # =============================================================================
 
@@ -618,30 +812,30 @@ def check_orderbook_depth(
     coin: str,
     is_buy: bool,
     size_usd: float,
-) -> tuple[bool, float]:
+) -> tuple[bool, float, float]:
     """
     Check if the orderbook has enough depth for our size with acceptable slippage.
 
-    Returns: (has_depth, estimated_fill_price)
+    Returns: (has_depth, avg_fill_price, best_price)
+        best_price = top of the side we're crossing (best ask for a buy).
     """
     try:
         book = client.get_l2_book(coin)
     except Exception as e:
         log.warning(f"Failed to fetch orderbook for {coin}: {e}")
-        return False, 0.0
+        return False, 0.0, 0.0
 
     # Parse the book — format: {"levels": [[bids], [asks]]}
-    # or {"coin": ..., "levels": ...}
     levels = book.get("levels", [[], []])
     if len(levels) < 2:
-        return False, 0.0
+        return False, 0.0, 0.0
 
     # For buying, we hit the asks; for selling, we hit the bids
-    side = levels[1] if is_buy else levels[0]  # asks for buy, bids for sell
+    side = levels[1] if is_buy else levels[0]
 
     if not side:
         log.debug(f"No {'asks' if is_buy else 'bids'} in book for {coin}")
-        return False, 0.0
+        return False, 0.0, 0.0
 
     # Walk the book and calculate fill price
     remaining_usd = size_usd
@@ -666,20 +860,20 @@ def check_orderbook_depth(
         if remaining_usd <= 0:
             break
 
-    if total_size <= 0 or remaining_usd > size_usd * 0.5:
-        log.debug(f"Insufficient depth for {coin}: filled only ${size_usd - remaining_usd:.2f} of ${size_usd:.2f}")
-        return False, 0.0
-
-    avg_fill = total_cost / total_size
     best_price = float(side[0].get("px", side[0][0]) if isinstance(side[0], dict) else side[0][0])
 
+    if total_size <= 0 or remaining_usd > size_usd * 0.5:
+        log.debug(f"Insufficient depth for {coin}: filled only ${size_usd - remaining_usd:.2f} of ${size_usd:.2f}")
+        return False, 0.0, best_price
+
+    avg_fill = total_cost / total_size
     slippage = abs(avg_fill - best_price) / best_price if best_price > 0 else 1.0
 
     has_depth = slippage <= CONFIG["max_slippage_pct"]
     if not has_depth:
         log.debug(f"Slippage too high for {coin}: {slippage:.4f} > {CONFIG['max_slippage_pct']}")
 
-    return has_depth, avg_fill
+    return has_depth, avg_fill, best_price
 
 
 # =============================================================================
@@ -699,8 +893,148 @@ class HyperliquidSniperBot:
         self._shutdown = threading.Event()
         self._btc_price: float = 0.0
         self._mids: dict[str, float] = {}
+        self._equity: float = 0.0
+        self._wallet_address: Optional[str] = self._derive_address(private_key)
         self._last_discovery = 0.0
         self._last_vol_update = 0.0
+        self._last_equity_update = 0.0
+        self._last_heartbeat = 0.0
+
+        # Daily loss kill-switch state (persisted to disk so restarts honor budget)
+        self._day_utc: str = ""
+        self._day_start_equity: float = 0.0
+        self._kill_switch_engaged: bool = False
+        self._load_daily_state()
+
+        # HTTP healthcheck server (Railway expects $PORT to bind)
+        self._health_server: Optional[HTTPServer] = None
+
+    @staticmethod
+    def _derive_address(private_key: str) -> Optional[str]:
+        try:
+            import eth_account
+            return eth_account.Account.from_key(private_key).address
+        except Exception as e:
+            log.error(f"Could not derive wallet address from private key: {e}")
+            return None
+
+    # ── Daily loss kill-switch ──
+
+    def _today_utc(self) -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _load_daily_state(self):
+        path = CONFIG["daily_state_file"]
+        try:
+            with open(path, "r") as f:
+                state = json.load(f)
+            self._day_utc = state.get("day_utc", "")
+            self._day_start_equity = float(state.get("day_start_equity", 0.0) or 0.0)
+            self._kill_switch_engaged = bool(state.get("kill_switch_engaged", False))
+            log.info(
+                f"Loaded daily state from {path}: day={self._day_utc} "
+                f"start_equity=${self._day_start_equity:.2f} kill={self._kill_switch_engaged}"
+            )
+        except FileNotFoundError:
+            log.info(f"No daily state file at {path} — fresh start")
+        except Exception as e:
+            log.warning(f"Failed to load daily state {path}: {e} — ignoring")
+
+    def _save_daily_state(self):
+        path = CONFIG["daily_state_file"]
+        try:
+            with open(path, "w") as f:
+                json.dump({
+                    "day_utc": self._day_utc,
+                    "day_start_equity": self._day_start_equity,
+                    "kill_switch_engaged": self._kill_switch_engaged,
+                }, f)
+        except Exception as e:
+            log.warning(f"Failed to persist daily state {path}: {e}")
+
+    def _kill_switch_can_trade(self) -> bool:
+        """Refresh day boundary, recompute kill-switch from latest equity."""
+        today = self._today_utc()
+        if today != self._day_utc:
+            # Day rollover: reset budget to current equity
+            self._day_utc = today
+            self._day_start_equity = self._equity
+            self._kill_switch_engaged = False
+            log.info(
+                f"UTC day rollover -> {today}, day_start_equity=${self._day_start_equity:.2f}"
+            )
+            self._save_daily_state()
+            return True
+
+        if self._day_start_equity <= 0:
+            # First read of the day arrived after init: anchor it now.
+            if self._equity > 0:
+                self._day_start_equity = self._equity
+                self._save_daily_state()
+            return True
+
+        limit_pct = CONFIG["daily_loss_limit_pct"]
+        loss = self._day_start_equity - self._equity
+        loss_pct = loss / self._day_start_equity if self._day_start_equity > 0 else 0.0
+        if loss_pct >= limit_pct and not self._kill_switch_engaged:
+            self._kill_switch_engaged = True
+            log.error(
+                f"KILL-SWITCH ENGAGED: day loss ${loss:.2f} ({loss_pct*100:.2f}%) "
+                f">= {limit_pct*100:.2f}% of day-start ${self._day_start_equity:.2f}"
+            )
+            self._save_daily_state()
+        return not self._kill_switch_engaged
+
+    # ── Healthcheck ──
+
+    def _start_health_server(self):
+        bot = self
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args, **kwargs):  # silence default access logs
+                return
+            def do_GET(self):
+                if self.path in ("/", "/health"):
+                    payload = {
+                        "status": "ok",
+                        "wallet": bot._wallet_address,
+                        "equity_usd": round(bot._equity, 2),
+                        "btc_price": bot._btc_price,
+                        "contracts_tracked": len(bot.contracts),
+                        "open_positions": bot.open_positions,
+                        "kill_switch_engaged": bot._kill_switch_engaged,
+                        "day_utc": bot._day_utc,
+                        "day_start_equity": bot._day_start_equity,
+                        "dry_run": CONFIG["dry_run"],
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                    }
+                    body = json.dumps(payload).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+        port = CONFIG["health_port"]
+        try:
+            self._health_server = HTTPServer(("0.0.0.0", port), Handler)
+            t = threading.Thread(target=self._health_server.serve_forever, daemon=True)
+            t.start()
+            log.info(f"Healthcheck listening on :{port}/health")
+        except Exception as e:
+            log.warning(f"Could not start healthcheck on port {port}: {e}")
+
+    def _heartbeat(self, force: bool = False):
+        now = time.time()
+        if not force and (now - self._last_heartbeat) < CONFIG["heartbeat_sec"]:
+            return
+        self._last_heartbeat = now
+        log.info(
+            f"HB equity=${self._equity:.2f} btc={self._btc_price:.2f} "
+            f"contracts={len(self.contracts)} open={self.open_positions} "
+            f"kill={self._kill_switch_engaged} day={self._day_utc}"
+        )
 
     # ── Lifecycle ──
 
@@ -708,15 +1042,28 @@ class HyperliquidSniperBot:
         """Start the bot — runs until Ctrl+C."""
         log.info("=" * 60)
         log.info("HIP-4 BTC PriceBinary Sniper Bot — Starting")
-        log.info(f"Position size: ${CONFIG['position_size_usd']}")
-        log.info(f"Edge threshold: {CONFIG['edge_threshold']}")
-        log.info(f"Max time window: {CONFIG['max_time_left_minutes']}min")
-        log.info(f"Min |d|: {CONFIG['min_abs_d']}")
+        log.info(
+            f"Risk: base={CONFIG['base_risk_pct']*100:.2f}%  "
+            f"max={CONFIG['max_risk_pct']*100:.2f}%  "
+            f"trade=${CONFIG['min_trade_usd']}-{CONFIG['max_trade_usd']}  "
+            f"edge_ref={CONFIG['edge_reference']}"
+        )
+        log.info(
+            f"Entry: edge≥{CONFIG['edge_threshold']}  "
+            f"|d|≥{CONFIG['min_abs_d']}  "
+            f"t≤{CONFIG['max_time_left_minutes']}min "
+            f"(ideal <{CONFIG['ideal_time_left_minutes']}min)"
+        )
+        log.info(f"Wallet: {self._wallet_address or '(unknown)'}")
         log.info("=" * 60)
 
         # Register signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
+
+        # Start healthcheck HTTP server (Railway expects $PORT bound)
+        self._start_health_server()
+        self._heartbeat(force=True)
 
         try:
             # Try async WebSocket approach first
@@ -739,6 +1086,7 @@ class HyperliquidSniperBot:
         # Initial setup
         self._refresh_btc_price()
         self._refresh_volatility()
+        self._refresh_equity()
         self._discover_contracts()
 
         # Start WebSocket listener in background
@@ -758,8 +1106,16 @@ class HyperliquidSniperBot:
                     self._refresh_volatility()
                     self._last_vol_update = now
 
+                # Periodic equity refresh
+                if now - self._last_equity_update >= CONFIG["equity_refresh_sec"]:
+                    self._refresh_equity()
+
                 # Refresh prices (fallback if WS is lagging)
                 self._refresh_btc_price()
+
+                # Refresh kill-switch + heartbeat
+                self._kill_switch_can_trade()
+                self._heartbeat()
 
                 # Evaluate all active contracts
                 self._evaluate_all_contracts()
@@ -845,7 +1201,12 @@ class HyperliquidSniperBot:
                     self._refresh_volatility()
                     self._last_vol_update = now
 
+                if now - self._last_equity_update >= CONFIG["equity_refresh_sec"]:
+                    self._refresh_equity()
+
                 self._refresh_btc_price()
+                self._kill_switch_can_trade()
+                self._heartbeat()
                 self._evaluate_all_contracts()
                 self._cleanup_expired()
 
@@ -860,24 +1221,37 @@ class HyperliquidSniperBot:
     # ── Core operations ──
 
     def _refresh_btc_price(self):
-        """Fetch current BTC price and all mids via REST."""
+        """Fetch current BTC price and outcome mids via REST."""
         try:
             mids = self.client.get_all_mids()
             if isinstance(mids, dict):
                 self._mids.update(mids)
-                # Try common BTC identifiers
-                for key in ["BTC", "BTC-PERP", "@1"]:
+                for key in ("BTC", "BTC-PERP", "@1"):
                     if key in mids:
-                        self._btc_price = float(mids[key])
-                        break
-                # Also update contract mids
-                for name, contract in self.contracts.items():
-                    if name in mids:
                         try:
-                            contract.last_yes_mid = float(mids[name])
-                            contract.last_no_mid = 1.0 - contract.last_yes_mid
+                            self._btc_price = float(mids[key])
                         except (ValueError, TypeError):
                             pass
+                        break
+                # Update each contract's Yes/No mid via its outcome coin keys.
+                for contract in self.contracts.values():
+                    yes_raw = mids.get(contract.yes_coin)
+                    no_raw = mids.get(contract.no_coin)
+                    if yes_raw is not None:
+                        try:
+                            contract.last_yes_mid = float(yes_raw)
+                        except (ValueError, TypeError):
+                            pass
+                    if no_raw is not None:
+                        try:
+                            contract.last_no_mid = float(no_raw)
+                        except (ValueError, TypeError):
+                            pass
+                    # If only one side present, derive the other.
+                    if contract.last_yes_mid is not None and contract.last_no_mid is None:
+                        contract.last_no_mid = 1.0 - contract.last_yes_mid
+                    elif contract.last_no_mid is not None and contract.last_yes_mid is None:
+                        contract.last_yes_mid = 1.0 - contract.last_no_mid
         except Exception as e:
             log.debug(f"Price refresh failed: {e}")
 
@@ -887,6 +1261,29 @@ class HyperliquidSniperBot:
         if candles:
             self.vol_calc.load_from_candles(candles)
         self._last_vol_update = time.time()
+
+    def _refresh_equity(self):
+        """
+        Equity = spot USDH balance of the *trading account* (master wallet if
+        we're using an agent, otherwise the signer itself). HIP-4 outcomes are
+        USDH-collateralized.
+        """
+        # Prefer master wallet (agent setup); fall back to signer address.
+        master = os.environ.get("HL_ACCOUNT_ADDRESS", "").strip() or None
+        addr = master or self._wallet_address
+        if not addr:
+            return
+        try:
+            equity = self.client.get_usdh_balance(addr)
+            if equity > 0:
+                if abs(equity - self._equity) > 0.01:
+                    log.info(f"Equity refreshed (USDH @ {addr[:10]}…): ${equity:.2f}")
+                self._equity = equity
+            else:
+                log.warning(f"USDH spot balance is 0 for {addr} — bot will not trade")
+        except Exception as e:
+            log.debug(f"Equity refresh failed: {e}")
+        self._last_equity_update = time.time()
 
     def _discover_contracts(self):
         """Discover and register active BTC priceBinary contracts."""
@@ -922,14 +1319,13 @@ class HyperliquidSniperBot:
 
             # Skip if no mid price for this contract
             if contract.last_yes_mid is None:
-                # Try to get from stored mids
-                if name in self._mids:
-                    try:
-                        contract.last_yes_mid = float(self._mids[name])
-                        contract.last_no_mid = 1.0 - contract.last_yes_mid
-                    except (ValueError, TypeError):
-                        continue
-                else:
+                yes_raw = self._mids.get(contract.yes_coin)
+                if yes_raw is None:
+                    continue
+                try:
+                    contract.last_yes_mid = float(yes_raw)
+                    contract.last_no_mid = 1.0 - contract.last_yes_mid
+                except (ValueError, TypeError):
                     continue
 
             # Skip if yes_mid is invalid
@@ -958,68 +1354,110 @@ class HyperliquidSniperBot:
                 self._execute_trade(contract, decision)
 
     def _execute_trade(self, contract: BinaryContract, decision: TradeDecision):
-        """Execute a trade based on the decision."""
+        """Execute a trade with dynamic position sizing per the risk model."""
         if self.open_positions >= CONFIG["max_open_positions"]:
             log.warning(f"Max positions ({CONFIG['max_open_positions']}) reached — skipping {contract.asset_name}")
             return
 
-        is_buy_yes = decision.action == "BUY_YES"
-        coin = contract.asset_name  # The Yes token coin name
+        if self._equity <= 0:
+            log.warning(f"Equity unavailable — cannot size trade on {contract.asset_name}")
+            return
 
-        # Check orderbook depth
-        has_depth, est_fill = check_orderbook_depth(
+        if self._equity < CONFIG["equity_floor_usd"]:
+            log.warning(
+                f"Equity ${self._equity:.2f} below floor ${CONFIG['equity_floor_usd']:.2f} "
+                f"— halting trades on {contract.asset_name}"
+            )
+            return
+
+        if not self._kill_switch_can_trade():
+            log.warning(f"Kill-switch active — skipping {contract.asset_name}")
+            return
+
+        is_buy_yes = decision.action == "BUY_YES"
+        coin = contract.yes_coin if is_buy_yes else contract.no_coin
+
+        # entry_price = the side we're buying (Yes mid for BUY_YES, else No mid = 1 - Yes mid)
+        current_mid = decision.market_mid_yes if is_buy_yes else (1.0 - decision.market_mid_yes)
+
+        # Initial sizing at the mid to choose a depth probe size
+        probe_risk, _ = compute_position_size(
+            equity=self._equity,
+            edge=decision.edge,
+            entry_price=current_mid,
+        )
+
+        has_depth, _, best_price = check_orderbook_depth(
             self.client,
             coin=coin,
             is_buy=True,
-            size_usd=CONFIG["position_size_usd"],
+            size_usd=probe_risk,
         )
 
         if not has_depth:
             log.info(f"Insufficient depth for {contract.asset_name} — skipping")
             return
 
-        # Calculate order price that preserves edge
-        if is_buy_yes:
-            # We want to buy Yes — max price = model_prob - (1 - edge_preservation) * edge
-            max_price = decision.p_model_yes - (1 - CONFIG["edge_preservation_min"]) * decision.edge
-            price = min(est_fill, max_price)
-            size = CONFIG["position_size_usd"] / price if price > 0 else 0
-        else:
-            # We want to buy No — buying No is equivalent to selling Yes or buying on the No side
-            # No token price = 1 - Yes_mid
-            no_price = 1.0 - decision.market_mid_yes
-            max_no_price = (1.0 - decision.p_model_yes) + (1 - CONFIG["edge_preservation_min"]) * decision.edge
-            price = min(no_price, max_no_price)
-            size = CONFIG["position_size_usd"] / price if price > 0 else 0
-            # For No, we might need to use a different coin or short Yes
-            # This depends on the HIP-4 contract structure
+        # Use the worse of (current_mid, best_ask) — best ask for safety
+        entry_price = max(current_mid, best_price) if best_price > 0 else current_mid
 
-        if size <= 0:
-            log.warning(f"Calculated size <= 0 for {contract.asset_name} — skipping")
+        # Edge-preservation guard: don't pay above (model_prob - (1-pres)*edge) on the side we're buying
+        model_prob_side = decision.p_model_yes if is_buy_yes else (1.0 - decision.p_model_yes)
+        max_price = model_prob_side - (1.0 - CONFIG["edge_preservation_min"]) * decision.edge
+        if entry_price > max_price:
+            log.info(
+                f"Best price {entry_price:.4f} > edge-preservation cap {max_price:.4f} "
+                f"for {contract.asset_name} — skipping"
+            )
+            return
+
+        # Final sizing at the actual entry price
+        risk_amount, shares = compute_position_size(
+            equity=self._equity,
+            edge=decision.edge,
+            entry_price=entry_price,
+        )
+
+        if shares <= 0:
+            log.warning(
+                f"Sizing produced 0 shares for {contract.asset_name} "
+                f"(equity=${self._equity:.2f}, risk=${risk_amount:.2f}, "
+                f"price={entry_price:.4f}) — skipping"
+            )
             return
 
         log.info("=" * 50)
-        log.info(f"EXECUTING TRADE: {decision.action} on {contract.asset_name}")
-        log.info(f"  BTC={decision.btc_price:.2f} Strike={decision.strike:.2f}")
-        log.info(f"  P_model={decision.p_model_yes:.4f} Mid={decision.market_mid_yes:.4f}")
-        log.info(f"  Edge={decision.edge:.4f} d={decision.d_value:.3f}")
-        log.info(f"  Price={price:.4f} Size={size:.2f} ({CONFIG['position_size_usd']}$)")
+        log.info(f"EXECUTING TRADE: {decision.action} on {contract.asset_name} (coin={coin})")
+        log.info(f"  Equity=${self._equity:.2f}  Risk=${risk_amount:.2f}  "
+                 f"(edge_scale={decision.edge / CONFIG['edge_reference']:.2f}x)")
+        log.info(f"  BTC={decision.btc_price:.2f}  K={decision.strike:.2f}")
+        log.info(f"  P_model={decision.p_model_yes:.4f}  YesMid={decision.market_mid_yes:.4f}")
+        log.info(f"  Edge={decision.edge:.4f}  d={decision.d_value:.3f}")
+        log.info(f"  Entry=${entry_price:.4f}  Shares={shares}")
         log.info("=" * 50)
 
-        # Place the order
+        if CONFIG["dry_run"]:
+            log.warning(f"DRY_RUN=true — would have placed: {coin} BUY size={shares} px={entry_price:.4f}")
+            contract.traded = True
+            return
+
         result = self.client.place_limit_order(
             coin=coin,
             is_buy=is_buy_yes,
-            size=round(size, 2),
-            price=round(price, 4),
+            size=shares,
+            price=round(entry_price, 4),
         )
 
         if "error" not in result:
             contract.traded = True
             self.open_positions += 1
-            log.info(f"Order submitted for {contract.asset_name}: {result}")
+            oid = result.get("resting_oid") or result.get("filled_oid")
+            log.info(
+                f"Order accepted for {contract.asset_name}: oid={oid} "
+                f"{'(resting)' if 'resting_oid' in result else '(filled)'}"
+            )
         else:
-            log.error(f"Order failed for {contract.asset_name}: {result}")
+            log.error(f"Order failed for {contract.asset_name}: {result['error']}")
 
     def _cleanup_expired(self):
         """Remove expired contracts from tracking."""

@@ -34,24 +34,45 @@ Where:
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env   # then edit .env
 ```
 
 ## Configuration
 
-Set your private key:
-```bash
-export HYPERLIQUID_PRIVATE_KEY="0xYOUR_PRIVATE_KEY_HERE"
+All knobs are env vars (see `.env.example`). The only required one is the signing key:
+
+```
+HYPERLIQUID_PRIVATE_KEY=0xYOUR_AGENT_WALLET_KEY
 ```
 
-Edit the `CONFIG` dict at the top of `sniper.py` to adjust:
-- `position_size_usd` — max trade size (default $25)
-- `edge_threshold` — minimum edge to trade (default 0.10)
-- `max_time_left_minutes` — latest entry window (default 5 min)
-- `min_abs_d` — minimum |d| for entry (default 1.8)
-- `vol_windows` — lookback windows for volatility calc
-- `vol_multiplier` — conservatism factor on vol (default 1.3)
+The bot uses **HIP-4 outcomeMeta** for discovery and addresses each side of every binary as `#<10*outcome+side>` (Yes = side 0, No = side 1). Settlement collateral is **USDH**.
 
-## Running
+### Sizing (env-driven)
+
+| Var | Default | Purpose |
+|---|---|---|
+| `SIZE_PCT_OF_EQUITY` | 0.05 | Baseline % of equity per trade |
+| `SIZE_MAX_PCT_OF_EQUITY` | 0.10 | Hard ceiling as % of equity |
+| `SIZE_MIN_USD` | 10 | Floor per trade |
+| `SIZE_MAX_USD` | 200 | Ceiling per trade |
+| `TRAINING_WHEELS_MAX_USD` | 25 | Extra hard cap. Empty disables. |
+| `EQUITY_FLOOR_USD` | 50 | Halt trading below this balance |
+| `DAILY_LOSS_LIMIT_PCT` | 0.10 | Kill-switch when day P&L ≤ -10% |
+
+### Operational controls
+
+| Var | Default | Purpose |
+|---|---|---|
+| `DRY_RUN` | false | Log decisions, never sign |
+| `PORT` | 8080 | Healthcheck HTTP port (Railway sets this) |
+| `LOG_TO_STDOUT` / `LOG_TO_FILE` | true / false | |
+| `HEARTBEAT_SEC` | 60 | Periodic status log cadence |
+
+### Healthcheck
+
+`GET /health` (or `/`) returns JSON with equity, BTC price, contracts tracked, kill-switch state, and day P&L anchor. Useful for Railway healthchecks and local debugging.
+
+## Running locally
 
 ```bash
 python sniper.py
@@ -67,14 +88,28 @@ The bot will:
 
 ## Logging
 
-Logs go to both console and `sniper.log` file with timestamps, prices, model params, and trade decisions.
+Stdout-first (Railway-friendly). UTC timestamps. Set `LOG_TO_FILE=true` to also write to `sniper.log`.
+
+## Deploy to Railway
+
+1. Connect this repo to a Railway project.
+2. Set env vars in Railway:
+   - `HYPERLIQUID_PRIVATE_KEY` (required, agent wallet preferred)
+   - any sizing overrides from `.env.example`
+   - leave `PORT` alone — Railway injects it.
+3. Procfile is `worker: python -u sniper.py`. The `-u` flag is important so logs flush immediately.
+4. **First deploy: set `DRY_RUN=true`.** Watch logs for one full daily cycle (24h around 06:00 UTC) to confirm the bot discovers the new outcome, sizes correctly, and would have placed sane orders. Then unset `DRY_RUN` to go live.
+5. The `daily_state.json` kill-switch file lives on local disk. Railway containers are ephemeral, so on redeploy the budget resets. Mount a Railway volume at the repo root if you want persistence across deploys.
 
 ## Safety
 
-- **Small size**: Default $25 position, configurable
-- **Strict conditions**: Won't trade unless ALL conditions pass
-- **Single trade per contract**: Stops monitoring after fill
-- **Graceful shutdown**: Ctrl+C cleanly exits
+- **Equity-based sizing** with hard $ cap and `TRAINING_WHEELS_MAX_USD` short-circuit
+- **Daily loss kill-switch** that halts further trading until next UTC day
+- **Equity floor** below which the bot refuses to trade
+- **`DRY_RUN`** to validate the full decision path without signing
+- **Strict entry conditions**: edge ≥ 0.10, |d| ≥ 1.8, ≤ 5 min to expiry, depth check
+- **Single trade per contract** within a session
+- **Graceful SIGTERM** for Railway redeploys
 
 ## Disclaimer
 
